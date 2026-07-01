@@ -1,0 +1,3 @@
+[submodule "Components/LR2021Hal"]
+	path = Components/LR2021Hal
+	url = https://github.com/Lora-net/usp
