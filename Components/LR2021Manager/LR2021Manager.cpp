@@ -47,7 +47,7 @@ bool LR2021Manager ::spiTransfer(const U8* tx, U8* rx, U16 len) {
     if (status != Drv::SpiStatus::SPI_OK) {
         Fw::LogStringArg msg;
         msg.format("SPI transfer failed (status=%d, len=%u)", static_cast<int>(status.e), len);
-        this->log_DIAGNOSTIC_Debug(msg);
+        this->log_DIAGNOSTIC_LR2021(msg);
         return false;
     }
     return true;
@@ -102,12 +102,22 @@ bool LR2021Manager ::waitOnBusy(U32 timeout_us) {
     // reset, unpowered, or the BUSY line is miswired.
     Fw::LogStringArg msg;
     msg.format("BUSY stuck high; radio not ready (timeout %u us)", timeout_us);
-    this->log_DIAGNOSTIC_Debug(msg);
+    this->log_DIAGNOSTIC_LR2021(msg);
     return false;
 }
 
+void LR2021Manager ::chipVersion() {
+    lr20xx_system_version_t version = {0, 0};
+    lr20xx_status_t status = lr20xx_system_get_version(this, &version);
+    if (status == LR20XX_STATUS_OK) {
+        Fw::LogStringArg msg;
+        msg.format("Chip Version %X.%X", version.major, version.minor);
+        this->log_DIAGNOSTIC_LR2021(msg);
+    }
+}
+
 void LR2021Manager ::logDebug(const Fw::LogStringArg& msg) {
-    this->log_DIAGNOSTIC_Debug(msg);
+    this->log_DIAGNOSTIC_LR2021(msg);
 }
 
 void LR2021Manager ::logHex(const char* tag, const U8* data, U16 len) {
@@ -117,7 +127,7 @@ void LR2021Manager ::logHex(const char* tag, const U8* data, U16 len) {
         off += snprintf(buf + off, static_cast<size_t>(sizeof(buf) - off), " %02X", data[i]);
     }
     Fw::LogStringArg msg(buf);
-    this->log_DIAGNOSTIC_Debug(msg);
+    this->log_DIAGNOSTIC_LR2021(msg);
 }
 
 // ----------------------------------------------------------------------
@@ -135,18 +145,6 @@ void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
 void LR2021Manager ::RESET_cmdHandler(FwOpcodeType opCode, U32 cmdSeq) {
     lr20xx_status_t status = lr20xx_system_reset(this);
     if (status == LR20XX_STATUS_OK) {
-        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
-    } else {
-        this->log_WARNING_HI_HalError(static_cast<I32>(status));
-        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::EXECUTION_ERROR);
-    }
-}
-
-void LR2021Manager ::GET_VERSION_cmdHandler(FwOpcodeType opCode, U32 cmdSeq) {
-    lr20xx_system_version_t version = {0, 0};
-    lr20xx_status_t status = lr20xx_system_get_version(this, &version);
-    if (status == LR20XX_STATUS_OK) {
-        this->log_ACTIVITY_HI_Version(version.major, version.minor);
         this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
     } else {
         this->log_WARNING_HI_HalError(static_cast<I32>(status));

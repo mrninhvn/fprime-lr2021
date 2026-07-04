@@ -11,19 +11,12 @@ module LR2021 {
         @ Reset the LR2021 radio (toggles the NRESET line and re-initialises)
         async command RESET
 
-        @ Read and report the LR2021 firmware version over SPI
-        async command GET_VERSION
-
         # ----------------------------------------------------------------------
         # Events
         # ----------------------------------------------------------------------
 
         @ Debug log message
-        event Debug(msg: string size 200) severity diagnostic format "LR2021: {}"
-
-        @ Reported firmware version
-        event Version(major: U8, minor: U8) severity activity high \
-            format "LR2021 version {}.{}"
+        event LR2021(msg: string size 128) severity diagnostic format "{}"
 
         @ HAL / SPI operation failed
         event HalError(status: I32) severity warning high \

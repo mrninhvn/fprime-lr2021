@@ -75,6 +75,9 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! \return true when the radio is ready, false on timeout / error
     bool waitOnBusy(U32 timeout_us = BUSY_TIMEOUT_US);
 
+    //! Get chip version, make sure SPI is working and the radio is responding.
+    void chipVersion();
+
     //! Emit a debug event
     void logDebug(const Fw::LogStringArg& msg);
 
@@ -108,13 +111,6 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     void RESET_cmdHandler(FwOpcodeType opCode,  //!< The opcode
                           U32 cmdSeq            //!< The command sequence number
                           ) override;
-
-    //! Handler implementation for command GET_VERSION
-    //!
-    //! Read and report the LR2021 firmware version over SPI
-    void GET_VERSION_cmdHandler(FwOpcodeType opCode,  //!< The opcode
-                                U32 cmdSeq            //!< The command sequence number
-                                ) override;
 };
 
 //! Global pointer to the (single) manager instance, used by the C HAL bridge
