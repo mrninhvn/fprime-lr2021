@@ -4,12 +4,49 @@ module LR2021 {
     @ plus reset / busy GPIO lines.
     active component LR2021Manager {
 
+        @ Port invoked when the driver is ready to send/receive data
+        output port ready: Drv.ByteStreamReady
+
+        @ Port invoked by the driver when it receives data
+        output port $recv: Drv.ByteStreamData
+
+        @ Port receiving back ownership of data sent out on $recv port
+        guarded input port recvReturnIn: Fw.BufferSend
+
+        @ ComStub async
+        async input port asyncSendIn: Fw.BufferSend
+
+        @ ComStub return buffer
+        output port asyncSendReturnIn: Drv.ByteStreamData
+
+        @Allocate new buffer
+        output port allocate: Fw.BufferGet
+
+        @return the allocated buffer
+        output port deallocate: Fw.BufferSend
+
         # ----------------------------------------------------------------------
         # Commands
         # ----------------------------------------------------------------------
 
         @ Reset the LR2021 radio (toggles the NRESET line and re-initialises)
         async command RESET
+
+        @ Configure the radio for FLRC operation (2.4 GHz band)
+        async command FLRC_INIT(
+            freq_hz: U32 @< RF centre frequency in Hz (e.g. 2444000000)
+            power_dbm: I8 @< TX output power in dBm
+        )
+
+        @ Transmit a payload using FLRC (radio must be FLRC-initialised)
+        async command FLRC_TX(
+            data: string size 200 @< Payload to transmit
+        )
+
+        @ Enter FLRC receive mode
+        async command FLRC_RX(
+            timeout_ms: U32 @< RX timeout in ms; 0 for continuous RX
+        )
 
         # ----------------------------------------------------------------------
         # Events
@@ -22,16 +59,39 @@ module LR2021 {
         event HalError(status: I32) severity warning high \
             format "LR2021 HAL error: {}" throttle 5
 
+        @ FLRC packet transmission completed
+        event FlrcTxDone() severity activity high format "FLRC TX done"
+
+        @ FLRC packet received
+        event FlrcRxPacket(length: U16, rssi: I16) severity activity high \
+            format "FLRC RX packet: {} bytes, RSSI {} dBm"
+
+        @ FLRC radio error (timeout / CRC / length), raw IRQ mask
+        event FlrcError(irq: U32) severity warning high \
+            format "FLRC radio error, IRQ mask 0x{x}" throttle 5
+
         # ----------------------------------------------------------------------
         # Telemetry
         # ----------------------------------------------------------------------
+
+        @ Count of FLRC packets transmitted
+        telemetry FlrcTxCount: U32 update on change
+
+        @ Count of FLRC packets received
+        telemetry FlrcRxCount: U32 update on change
+
+        @ RSSI of the last received FLRC packet, in dBm
+        telemetry FlrcRssi: I16 update on change
 
         # ----------------------------------------------------------------------
         # Radio interface ports
         # ----------------------------------------------------------------------
 
-        @ Rate-group input for periodic servicing (e.g. IRQ / RX polling)
-        sync input port run: Svc.Sched
+        @ Rate-group input for periodic servicing (IRQ / RX polling).
+        @ Async so the SPI polling runs on this component's thread.
+        @ Drop on queue overflow: ticks may pile up while a slow radio
+        @ operation (busy-wait) blocks the thread; missing one is harmless.
+        async input port run: Svc.Sched drop
 
         @ SPI bus port (connected to a ZephyrSpiDriver instance)
         output port spiWriteRead: Drv.SpiWriteRead
@@ -41,6 +101,11 @@ module LR2021 {
 
         @ BUSY line, read to know when the radio is ready for a command
         output port busyGpioRead: Drv.GpioRead
+
+        @ IRQ line (radio DIO7). Read from the run handler to skip the SPI
+        @ IRQ-status poll when no IRQ is pending. Optional: when unconnected
+        @ the component polls IRQ status over SPI every run tick.
+        output port irqGpioRead: Drv.GpioRead
 
         # ----------------------------------------------------------------------
         # Standard AC Ports: Required for Channels, Events, Commands, Parameters

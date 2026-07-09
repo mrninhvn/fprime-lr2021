@@ -106,6 +106,18 @@ bool LR2021Manager ::waitOnBusy(U32 timeout_us) {
     return false;
 }
 
+bool LR2021Manager ::irqPending() {
+    // Without an IRQ line connected the caller must poll over SPI.
+    if (!this->isConnected_irqGpioRead_OutputPort(0)) {
+        return true;
+    }
+    Fw::Logic state = Fw::Logic::LOW;
+    if (this->irqGpioRead_out(0, state) != Drv::GpioStatus::OP_OK) {
+        return true;  // read failed: fall back to the SPI poll
+    }
+    return state == Fw::Logic::HIGH;
+}
+
 void LR2021Manager ::chipVersion() {
     lr20xx_system_version_t version = {0, 0};
     lr20xx_status_t status = lr20xx_system_get_version(this, &version);
@@ -135,7 +147,34 @@ void LR2021Manager ::logHex(const char* tag, const U8* data, U16 len) {
 // ----------------------------------------------------------------------
 
 void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
-    // Reserved for periodic IRQ / RX servicing. No-op for now.
+    // Poll radio IRQs (TX done / RX done / errors) while FLRC is active.
+    this->flrcService();
+}
+
+void LR2021Manager ::asyncSendIn_handler(FwIndexType portNum,
+                                         Fw::Buffer& sendBuffer) {
+    // DEBUG("portNum=%d, sendBuffer.size=%llu", portNum, sendBuffer.getSize());
+    Drv::ByteStreamStatus status = Drv::ByteStreamStatus::SEND_RETRY;
+    if (this->m_txInFlight) {
+        if (this->isConnected_asyncSendReturnIn_OutputPort(0)) {
+            this->asyncSendReturnIn_out(0, sendBuffer, Drv::ByteStreamStatus::SEND_RETRY);
+        }
+        return;
+    }
+    if(!sendBuffer.isValid() || sendBuffer.getSize() == 0) {
+        DEBUG("!sendBuffer.isValid()");
+        if (this->isConnected_asyncSendReturnIn_OutputPort(0)) {
+            this->asyncSendReturnIn_out(0, sendBuffer, Drv::ByteStreamStatus::RECV_NO_DATA);
+        }
+        return;
+    }
+
+    m_workingBuffer = sendBuffer;
+    this->flrcTx(m_workingBuffer.getData(), m_workingBuffer.getSize());
+}
+
+void LR2021Manager ::recvReturnIn_handler(FwIndexType portNum, Fw::Buffer& fwBuffer) {
+    this->deallocate_out(0, fwBuffer);
 }
 
 // ----------------------------------------------------------------------
@@ -150,6 +189,24 @@ void LR2021Manager ::RESET_cmdHandler(FwOpcodeType opCode, U32 cmdSeq) {
         this->log_WARNING_HI_HalError(static_cast<I32>(status));
         this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::EXECUTION_ERROR);
     }
+}
+
+void LR2021Manager ::FLRC_INIT_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U32 freq_hz, I8 power_dbm) {
+    this->cmdResponse_out(opCode, cmdSeq,
+                          this->flrcInit(freq_hz, power_dbm) ? Fw::CmdResponse::OK
+                                                             : Fw::CmdResponse::EXECUTION_ERROR);
+}
+
+void LR2021Manager ::FLRC_TX_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, const Fw::CmdStringArg& data) {
+    const bool ok = this->flrcTx(reinterpret_cast<const U8*>(data.toChar()),
+                                 static_cast<U16>(data.length()));
+    this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
+}
+
+void LR2021Manager ::FLRC_RX_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U32 timeout_ms) {
+    this->cmdResponse_out(opCode, cmdSeq,
+                          this->flrcRx(timeout_ms) ? Fw::CmdResponse::OK
+                                                   : Fw::CmdResponse::EXECUTION_ERROR);
 }
 
 }  // namespace LR2021

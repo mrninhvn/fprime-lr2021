@@ -20,6 +20,7 @@ set(lr20xx_src
     "${LR20XX_DRIVER}/src/lr20xx_workarounds.c"
     "${LR20XX_DRIVER}/src/lr20xx_radio_lora.c"
     "${LR20XX_DRIVER}/src/lr20xx_radio_fsk.c"
+    "${LR20XX_DRIVER}/src/lr20xx_radio_flrc.c"
 )
 
 include_directories(
@@ -32,6 +33,8 @@ register_fprime_module(
     SOURCES
         "${CMAKE_CURRENT_LIST_DIR}/LR2021Manager.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/LR2021Hal.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/LR2021Cfg.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/LR2021Flrc.cpp"
         ${lr20xx_src}
     DEPENDS
         Fw_Types

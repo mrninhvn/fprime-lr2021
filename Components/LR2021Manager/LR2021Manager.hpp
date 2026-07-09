@@ -54,6 +54,19 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     ~LR2021Manager();
 
   public:
+    //! Handler implementation for send
+    //!
+    void asyncSendIn_handler(FwIndexType portNum,
+                             Fw::Buffer& sendBuffer) override;
+    
+    //! Handler implementation for recvReturnIn
+    //!
+    //! Port receiving back ownership of data sent out on $recv port
+    void recvReturnIn_handler(FwIndexType portNum,  //!< The port number
+                              Fw::Buffer& fwBuffer  //!< The buffer
+                              ) override;
+
+  public:
     // ----------------------------------------------------------------------
     // Helpers used by the HAL bridge (LR2021Hal.cpp)
     // ----------------------------------------------------------------------
@@ -75,8 +88,41 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! \return true when the radio is ready, false on timeout / error
     bool waitOnBusy(U32 timeout_us = BUSY_TIMEOUT_US);
 
+    //! Read the IRQ line (radio DIO7). Returns true when an IRQ is pending,
+    //! or when no IRQ port is connected (callers then poll over SPI).
+    bool irqPending();
+
     //! Get chip version, make sure SPI is working and the radio is responding.
     void chipVersion();
+
+    //! Initialize the radio chip (HF PA / RX path, etc.).
+    bool radioInit();
+
+    // ----------------------------------------------------------------------
+    // FLRC radio operations (implemented in LR2021Flrc.cpp)
+    // ----------------------------------------------------------------------
+
+    //! Maximum FLRC payload handled by this component, in bytes
+    static constexpr U16 FLRC_MAX_PAYLOAD = 511;
+    //! Minimum FLRC payload allowed by the radio, in bytes
+    static constexpr U16 FLRC_MIN_PAYLOAD = 6;
+
+    //! Configure the radio for FLRC: packet type, RF frequency, HF PA/RX
+    //! path, modulation / packet params and syncword.
+    //! \return true on success
+    bool flrcInit(U32 freq_hz, I8 power_dbm);
+
+    //! Transmit \p len bytes (padded up to FLRC_MIN_PAYLOAD if shorter)
+    //! \return true on success
+    bool flrcTx(const U8* data, U16 len);
+
+    //! Enter RX mode; timeout_ms == 0 selects continuous RX
+    //! \return true on success
+    bool flrcRx(U32 timeout_ms);
+
+    //! Poll and handle radio IRQs (TX done / RX done / errors).
+    //! Called from the rate-group run handler while FLRC is active.
+    void flrcService();
 
     //! Emit a debug event
     void logDebug(const Fw::LogStringArg& msg);
@@ -111,6 +157,36 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     void RESET_cmdHandler(FwOpcodeType opCode,  //!< The opcode
                           U32 cmdSeq            //!< The command sequence number
                           ) override;
+
+    //! Handler implementation for command FLRC_INIT
+    void FLRC_INIT_cmdHandler(FwOpcodeType opCode,  //!< The opcode
+                              U32 cmdSeq,           //!< The command sequence number
+                              U32 freq_hz,          //!< RF centre frequency in Hz
+                              I8 power_dbm          //!< TX output power in dBm
+                              ) override;
+
+    //! Handler implementation for command FLRC_TX
+    void FLRC_TX_cmdHandler(FwOpcodeType opCode,  //!< The opcode
+                            U32 cmdSeq,           //!< The command sequence number
+                            const Fw::CmdStringArg& data  //!< Payload to transmit
+                            ) override;
+
+    //! Handler implementation for command FLRC_RX
+    void FLRC_RX_cmdHandler(FwOpcodeType opCode,  //!< The opcode
+                            U32 cmdSeq,           //!< The command sequence number
+                            U32 timeout_ms        //!< RX timeout in ms; 0 for continuous
+                            ) override;
+
+  private:
+    // ----------------------------------------------------------------------
+    // FLRC state
+    // ----------------------------------------------------------------------
+    bool m_flrcInited = false;   //!< FLRC_INIT completed successfully
+    bool m_rxContinuous = false; //!< Re-enter RX automatically after each packet
+    bool m_txInFlight = false;   //!< TX started, TX_DONE not yet seen
+    U32 m_txCount = 0;           //!< Packets transmitted
+    U32 m_rxCount = 0;           //!< Packets received
+    Fw::Buffer m_workingBuffer;
 };
 
 //! Global pointer to the (single) manager instance, used by the C HAL bridge
