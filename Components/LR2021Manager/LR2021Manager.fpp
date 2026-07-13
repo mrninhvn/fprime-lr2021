@@ -4,6 +4,16 @@ module LR2021 {
     @ plus reset / busy GPIO lines.
     active component LR2021Manager {
 
+        # ----------------------------------------------------------------------
+        # Types
+        # ----------------------------------------------------------------------
+
+        @ Radio modulation mode
+        enum Mode {
+            FLRC @< Fast Long Range Communication
+            FSK @< GMSK Frequency Shift Keying
+        }
+
         @ Port invoked when the driver is ready to send/receive data
         output port ready: Drv.ByteStreamReady
 
@@ -29,23 +39,15 @@ module LR2021 {
         # Commands
         # ----------------------------------------------------------------------
 
-        @ Reset the LR2021 radio (toggles the NRESET line and re-initialises)
+        @ Reset the LR2021 radio and re-initialise it, restoring the active mode
         async command RESET
 
-        @ Configure the radio for FLRC operation (2.4 GHz band)
-        async command FLRC_INIT(
+        @ Switch the active modulation at runtime (re-initialises the radio
+        @ and enters continuous RX)
+        async command SET_MODE(
+            mode: Mode @< Modulation to activate
             freq_hz: U32 @< RF centre frequency in Hz (e.g. 2444000000)
             power_dbm: I8 @< TX output power in dBm
-        )
-
-        @ Transmit a payload using FLRC (radio must be FLRC-initialised)
-        async command FLRC_TX(
-            data: string size 200 @< Payload to transmit
-        )
-
-        @ Enter FLRC receive mode
-        async command FLRC_RX(
-            timeout_ms: U32 @< RX timeout in ms; 0 for continuous RX
         )
 
         # ----------------------------------------------------------------------
@@ -59,6 +61,10 @@ module LR2021 {
         event HalError(status: I32) severity warning high \
             format "LR2021 HAL error: {}" throttle 5
 
+        @ Radio mode changed
+        event ModeSet(mode: Mode) severity activity high \
+            format "Radio mode set to {}"
+
         @ FLRC packet transmission completed
         event FlrcTxDone() severity activity high format "FLRC TX done"
 
@@ -69,6 +75,17 @@ module LR2021 {
         @ FLRC radio error (timeout / CRC / length), raw IRQ mask
         event FlrcError(irq: U32) severity warning high \
             format "FLRC radio error, IRQ mask 0x{x}" throttle 5
+
+        @ FSK packet transmission completed
+        event FskTxDone() severity activity high format "FSK TX done"
+
+        @ FSK packet received
+        event FskRxPacket(length: U16, rssi: I16) severity activity high \
+            format "FSK RX packet: {} bytes, RSSI {} dBm"
+
+        @ FSK radio error (timeout / CRC / length), raw IRQ mask
+        event FskError(irq: U32) severity warning high \
+            format "FSK radio error, IRQ mask 0x{x}" throttle 5
 
         # ----------------------------------------------------------------------
         # Telemetry
@@ -82,6 +99,15 @@ module LR2021 {
 
         @ RSSI of the last received FLRC packet, in dBm
         telemetry FlrcRssi: I16 update on change
+
+        @ Count of FSK packets transmitted
+        telemetry FskTxCount: U32 update on change
+
+        @ Count of FSK packets received
+        telemetry FskRxCount: U32 update on change
+
+        @ RSSI of the last received FSK packet, in dBm
+        telemetry FskRssi: I16 update on change
 
         # ----------------------------------------------------------------------
         # Radio interface ports

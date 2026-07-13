@@ -143,12 +143,51 @@ void LR2021Manager ::logHex(const char* tag, const U8* data, U16 len) {
 }
 
 // ----------------------------------------------------------------------
+// Mode selection
+// ----------------------------------------------------------------------
+
+bool LR2021Manager ::setMode(RadioMode mode, U32 freq_hz, I8 power_dbm) {
+    // A mode switch aborts any in-flight TX: return its buffer to the ComStub.
+    if (this->m_txInFlight && this->isConnected_asyncSendReturnIn_OutputPort(0)) {
+        Fw::Buffer buffer = m_workingBuffer;
+        m_workingBuffer = Fw::Buffer();
+        this->asyncSendReturnIn_out(0, buffer, Drv::ByteStreamStatus::SEND_RETRY);
+    }
+
+    bool ok = false;
+    switch (mode) {
+        case RadioMode::FLRC:
+            ok = this->flrcInit(freq_hz, power_dbm) && this->flrcRx(0);
+            break;
+        case RadioMode::FSK:
+            ok = this->fskInit(freq_hz, power_dbm) && this->fskRx(0);
+            break;
+        default:
+            break;
+    }
+    if (ok) {
+        this->m_freqHz = freq_hz;
+        this->m_powerDbm = power_dbm;
+    }
+    return ok;
+}
+
+// ----------------------------------------------------------------------
 // Handler implementations for typed input ports
 // ----------------------------------------------------------------------
 
 void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
-    // Poll radio IRQs (TX done / RX done / errors) while FLRC is active.
-    this->flrcService();
+    // Poll radio IRQs (TX done / RX done / errors) for the active mode.
+    switch (this->m_mode) {
+        case RadioMode::FLRC:
+            this->flrcService();
+            break;
+        case RadioMode::FSK:
+            this->fskService();
+            break;
+        default:
+            break;
+    }
 }
 
 void LR2021Manager ::asyncSendIn_handler(FwIndexType portNum,
@@ -170,7 +209,16 @@ void LR2021Manager ::asyncSendIn_handler(FwIndexType portNum,
     }
 
     m_workingBuffer = sendBuffer;
-    this->flrcTx(m_workingBuffer.getData(), m_workingBuffer.getSize());
+    switch (this->m_mode) {
+        case RadioMode::FLRC:
+            this->flrcTx(m_workingBuffer.getData(), m_workingBuffer.getSize());
+            break;
+        case RadioMode::FSK:
+            this->fskTx(m_workingBuffer.getData(), m_workingBuffer.getSize());
+            break;
+        default:
+            break;
+    }
 }
 
 void LR2021Manager ::recvReturnIn_handler(FwIndexType portNum, Fw::Buffer& fwBuffer) {
@@ -182,31 +230,38 @@ void LR2021Manager ::recvReturnIn_handler(FwIndexType portNum, Fw::Buffer& fwBuf
 // ----------------------------------------------------------------------
 
 void LR2021Manager ::RESET_cmdHandler(FwOpcodeType opCode, U32 cmdSeq) {
-    lr20xx_status_t status = lr20xx_system_reset(this);
-    if (status == LR20XX_STATUS_OK) {
-        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
-    } else {
-        this->log_WARNING_HI_HalError(static_cast<I32>(status));
-        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::EXECUTION_ERROR);
+    // radioInit() resets the chip and re-applies the chip-level config
+    // (regulator, clocks, DIO routing / RF switches).
+    bool ok = this->radioInit();
+    if (ok && (this->m_mode != RadioMode::NONE)) {
+        // Restore the previously active mode so the link comes back up.
+        ok = this->setMode(this->m_mode, this->m_freqHz, this->m_powerDbm);
     }
-}
-
-void LR2021Manager ::FLRC_INIT_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U32 freq_hz, I8 power_dbm) {
-    this->cmdResponse_out(opCode, cmdSeq,
-                          this->flrcInit(freq_hz, power_dbm) ? Fw::CmdResponse::OK
-                                                             : Fw::CmdResponse::EXECUTION_ERROR);
-}
-
-void LR2021Manager ::FLRC_TX_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, const Fw::CmdStringArg& data) {
-    const bool ok = this->flrcTx(reinterpret_cast<const U8*>(data.toChar()),
-                                 static_cast<U16>(data.length()));
     this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
 }
 
-void LR2021Manager ::FLRC_RX_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U32 timeout_ms) {
-    this->cmdResponse_out(opCode, cmdSeq,
-                          this->flrcRx(timeout_ms) ? Fw::CmdResponse::OK
-                                                   : Fw::CmdResponse::EXECUTION_ERROR);
+void LR2021Manager ::SET_MODE_cmdHandler(FwOpcodeType opCode,
+                                         U32 cmdSeq,
+                                         LR2021Manager_Mode mode,
+                                         U32 freq_hz,
+                                         I8 power_dbm) {
+    RadioMode target = RadioMode::NONE;
+    switch (mode.e) {
+        case LR2021Manager_Mode::FLRC:
+            target = RadioMode::FLRC;
+            break;
+        case LR2021Manager_Mode::FSK:
+            target = RadioMode::FSK;
+            break;
+        default:
+            break;
+    }
+
+    const bool ok = this->setMode(target, freq_hz, power_dbm);
+    if (ok) {
+        this->log_ACTIVITY_HI_ModeSet(mode);
+    }
+    this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
 }
 
 }  // namespace LR2021

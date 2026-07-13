@@ -99,6 +99,20 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     bool radioInit();
 
     // ----------------------------------------------------------------------
+    // Mode selection
+    // ----------------------------------------------------------------------
+
+    //! Active modulation / packet engine. Only one is active at a time
+    //! on the radio.
+    enum class RadioMode { NONE, FLRC, FSK };
+
+    //! Configure the radio for \p mode and enter continuous RX. Used for
+    //! the startup default (topology) and by the SET_MODE command.
+    //! Aborts any in-flight TX, returning its buffer to the ComStub.
+    //! \return true on success
+    bool setMode(RadioMode mode, U32 freq_hz, I8 power_dbm);
+
+    // ----------------------------------------------------------------------
     // FLRC radio operations (implemented in LR2021Flrc.cpp)
     // ----------------------------------------------------------------------
 
@@ -123,6 +137,39 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Poll and handle radio IRQs (TX done / RX done / errors).
     //! Called from the rate-group run handler while FLRC is active.
     void flrcService();
+
+    // ----------------------------------------------------------------------
+    // FSK radio operations (implemented in LR2021Fsk.cpp)
+    // ----------------------------------------------------------------------
+
+    //! Maximum FSK payload handled by this component, in bytes
+    static constexpr U16 FSK_MAX_PAYLOAD = 511;
+
+    //! CCSDS role of this node on the FSK channel. The spacecraft sends TM
+    //! frames on an ASM channel and receives TC frames as CLTUs
+    //! (CCSDS 231.0-B); ground is the mirror image.
+    enum class CcsdsRole { SPACECRAFT, GROUND };
+
+    //! Select the CCSDS role. Takes effect on the next TX/RX operation;
+    //! call before setMode(). Defaults to SPACECRAFT.
+    void setCcsdsRole(CcsdsRole role) { this->m_ccsdsRole = role; }
+
+    //! Configure the radio for FSK: packet type, RF frequency, PA/RX path,
+    //! modulation / packet params and syncword.
+    //! \return true on success
+    bool fskInit(U32 freq_hz, I8 power_dbm);
+
+    //! Transmit \p len bytes using FSK
+    //! \return true on success
+    bool fskTx(const U8* data, U16 len);
+
+    //! Enter FSK RX mode; timeout_ms == 0 selects continuous RX
+    //! \return true on success
+    bool fskRx(U32 timeout_ms);
+
+    //! Poll and handle radio IRQs (TX done / RX done / errors).
+    //! Called from the rate-group run handler while FSK is active.
+    void fskService();
 
     //! Emit a debug event
     void logDebug(const Fw::LogStringArg& msg);
@@ -153,39 +200,36 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
 
     //! Handler implementation for command RESET
     //!
-    //! Reset the LR2021 radio
+    //! Reset the LR2021 radio and re-initialise it, restoring the active mode
     void RESET_cmdHandler(FwOpcodeType opCode,  //!< The opcode
                           U32 cmdSeq            //!< The command sequence number
                           ) override;
 
-    //! Handler implementation for command FLRC_INIT
-    void FLRC_INIT_cmdHandler(FwOpcodeType opCode,  //!< The opcode
-                              U32 cmdSeq,           //!< The command sequence number
-                              U32 freq_hz,          //!< RF centre frequency in Hz
-                              I8 power_dbm          //!< TX output power in dBm
-                              ) override;
-
-    //! Handler implementation for command FLRC_TX
-    void FLRC_TX_cmdHandler(FwOpcodeType opCode,  //!< The opcode
-                            U32 cmdSeq,           //!< The command sequence number
-                            const Fw::CmdStringArg& data  //!< Payload to transmit
-                            ) override;
-
-    //! Handler implementation for command FLRC_RX
-    void FLRC_RX_cmdHandler(FwOpcodeType opCode,  //!< The opcode
-                            U32 cmdSeq,           //!< The command sequence number
-                            U32 timeout_ms        //!< RX timeout in ms; 0 for continuous
-                            ) override;
+    //! Handler implementation for command SET_MODE
+    //!
+    //! Switch the active modulation at runtime
+    void SET_MODE_cmdHandler(FwOpcodeType opCode,      //!< The opcode
+                             U32 cmdSeq,               //!< The command sequence number
+                             LR2021Manager_Mode mode,  //!< Modulation to activate
+                             U32 freq_hz,              //!< RF centre frequency in Hz
+                             I8 power_dbm              //!< TX output power in dBm
+                             ) override;
 
   private:
     // ----------------------------------------------------------------------
-    // FLRC state
+    // Radio state
     // ----------------------------------------------------------------------
-    bool m_flrcInited = false;   //!< FLRC_INIT completed successfully
+
+    RadioMode m_mode = RadioMode::NONE; //!< Modulation selected by the last successful setMode()
+    CcsdsRole m_ccsdsRole = CcsdsRole::SPACECRAFT; //!< CCSDS role on the FSK channel
+    U32 m_freqHz = 0;            //!< RF frequency of the last successful setMode()
+    I8 m_powerDbm = 0;           //!< TX power of the last successful setMode()
     bool m_rxContinuous = false; //!< Re-enter RX automatically after each packet
     bool m_txInFlight = false;   //!< TX started, TX_DONE not yet seen
-    U32 m_txCount = 0;           //!< Packets transmitted
-    U32 m_rxCount = 0;           //!< Packets received
+    U32 m_txCount = 0;           //!< FLRC packets transmitted
+    U32 m_rxCount = 0;           //!< FLRC packets received
+    U32 m_fskTxCount = 0;        //!< FSK packets transmitted
+    U32 m_fskRxCount = 0;        //!< FSK packets received
     Fw::Buffer m_workingBuffer;
 };
 

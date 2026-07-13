@@ -126,7 +126,7 @@ bool LR2021Manager ::flrcInit(U32 freq_hz, I8 power_dbm) {
     (void)lr20xx_system_get_and_clear_irq_status(this, &irq);
 
     DEBUG("FLRC init OK: %u Hz, %d dBm", static_cast<unsigned>(freq_hz), power_dbm);
-    this->m_flrcInited = true;
+    this->m_mode = RadioMode::FLRC;
     this->m_rxContinuous = false;
     this->m_txInFlight = false;
 
@@ -137,7 +137,7 @@ bool LR2021Manager ::flrcInit(U32 freq_hz, I8 power_dbm) {
 }
 
 bool LR2021Manager ::flrcTx(const U8* data, U16 len) {
-    if (!this->m_flrcInited || (data == nullptr) || (len == 0) || (len > FLRC_MAX_PAYLOAD)) {
+    if ((this->m_mode != RadioMode::FLRC) || (data == nullptr) || (len == 0) || (len > FLRC_MAX_PAYLOAD)) {
         return false;
     }
 
@@ -183,7 +183,7 @@ bool LR2021Manager ::flrcTx(const U8* data, U16 len) {
 }
 
 bool LR2021Manager ::flrcRx(U32 timeout_ms) {
-    if (!this->m_flrcInited) {
+    if (this->m_mode != RadioMode::FLRC) {
         return false;
     }
 
@@ -217,7 +217,7 @@ bool LR2021Manager ::flrcRx(U32 timeout_ms) {
 }
 
 void LR2021Manager ::flrcService() {
-    if (!this->m_flrcInited) {
+    if (this->m_mode != RadioMode::FLRC) {
         return;
     }
 
