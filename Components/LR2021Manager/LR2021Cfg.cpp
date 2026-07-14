@@ -18,6 +18,10 @@ extern "C" {
 namespace LR2021 {
 
 bool LR2021Manager ::radioInit() {
+    if (this->isConnected_powerGpioWrite_OutputPort(0)) {
+        this->powerGpioWrite_out(0, Fw::Logic::HIGH); 
+    }
+
     lr20xx_status_t status;
 
     status = lr20xx_system_reset(this);

@@ -122,6 +122,9 @@ module LR2021 {
         @ SPI bus port (connected to a ZephyrSpiDriver instance)
         output port spiWriteRead: Drv.SpiWriteRead
 
+        @ Power GPIO control, active high
+        output port powerGpioWrite: Drv.GpioWrite
+
         @ Reset (NRESET) GPIO control, active low
         output port resetGpioWrite: Drv.GpioWrite
 
