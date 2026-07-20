@@ -33,6 +33,7 @@ register_fprime_module(
     SOURCES
         "${CMAKE_CURRENT_LIST_DIR}/LR2021Manager.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/LR2021Hal.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/LR2021Adc.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/LR2021Cfg.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/LR2021Flrc.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/LR2021Fsk.cpp"

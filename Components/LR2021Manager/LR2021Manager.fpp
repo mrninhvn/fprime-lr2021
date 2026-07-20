@@ -1,4 +1,13 @@
 module LR2021 {
+
+    @ RF power measured by the LT5538 detectors on the antenna coupler,
+    @ fixed-point so the ground segment never has to decode floats.
+    @ Divide each field by 10 to recover dBm.
+    struct RfPower {
+        FwdDbmX10: I16   @< Forward power [deci-dBm] at the detector input
+        ReflDbmX10: I16  @< Reflected power [deci-dBm] at the detector input
+    }
+
     @ F Prime manager for the Semtech LR2021 (LR20xx) transceiver.
     @ Wraps the lr20xx_driver C driver and drives it over a Zephyr SPI bus
     @ plus reset / busy GPIO lines.
@@ -108,6 +117,13 @@ module LR2021 {
 
         @ RSSI of the last received FSK packet, in dBm
         telemetry FskRssi: I16 update on change
+
+        @ Forward / reflected RF power on the LR2021 antenna line, measured
+        @ by the LT5538 detectors on the PCB directional coupler (rf21 =
+        @ forward, rf2 = reflected). Sampled during each TX, right after the
+        @ PA ramps up. High reflected vs forward power indicates a bad
+        @ antenna match / disconnected antenna.
+        telemetry RfPower: RfPower update on change
 
         # ----------------------------------------------------------------------
         # Radio interface ports

@@ -171,6 +171,23 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Called from the rate-group run handler while FSK is active.
     void fskService();
 
+    // ----------------------------------------------------------------------
+    // RF power detectors (implemented in LR2021Adc.cpp)
+    // ----------------------------------------------------------------------
+
+    //! Read the LT5538 detectors on the LR2021 antenna coupler: forward
+    //! (RF2 tap) and reflected (RF21 tap) power, in dBm at the detector
+    //! inputs. Only meaningful while the PA is transmitting.
+    //! See LR2021Adc.cpp for the transfer function and calibration.
+    //! \return true when both channels were read successfully
+    bool readRfPower(F32& fwd_dbm, F32& refl_dbm);
+
+    //! Sample the RF detectors during the TX that just started and write
+    //! the RfFwdPower / RfReflPower telemetry. Waits a short settle time
+    //! for the PA ramp, so call right after set_tx succeeds (blocks the
+    //! component thread ~1 ms). Implemented in LR2021Adc.cpp.
+    void rfPowerMeasureTx();
+
     //! Emit a debug event
     void logDebug(const Fw::LogStringArg& msg);
 
@@ -230,6 +247,7 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     U32 m_rxCount = 0;           //!< FLRC packets received
     U32 m_fskTxCount = 0;        //!< FSK packets transmitted
     U32 m_fskRxCount = 0;        //!< FSK packets received
+    bool m_adcReady = false;     //!< RF detector ADC channels configured
     Fw::Buffer m_workingBuffer;
 };
 

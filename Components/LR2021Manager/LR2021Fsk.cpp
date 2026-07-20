@@ -197,11 +197,16 @@ lr20xx_status_t fskApplySyncword(LR2021Manager* mgr, bool tc_channel, bool is_tx
 // Build the packet params for a given payload length. With a variable-length
 // header mode the length acts as the TX payload length / RX maximum length;
 // with an implicit header it is the exact packet length.
-lr20xx_radio_fsk_pkt_params_t fskPktParams(uint16_t pld_len) {
+// long_preamble: required on the TC receive channel — without it the chip
+// cannot receive packets whose preamble exceeds ~2000 bits, and the PLOP
+// CMM-2 acquisition sequence of a real ground station is typically much
+// longer (seconds of idle). Minimum preamble with it enabled is detector
+// length + 8 bits + 10 us, well under our 32-bit TX preamble.
+lr20xx_radio_fsk_pkt_params_t fskPktParams(uint16_t pld_len, bool long_preamble) {
     lr20xx_radio_fsk_pkt_params_t params = {};
     params.pbl_length_in_bit     = FSK_PREAMBLE_BITS;
     params.preamble_detector     = FSK_PREAMBLE_DETECTOR;
-    params.long_preamble_enabled = false;
+    params.long_preamble_enabled = long_preamble;
     params.address_filtering     = LR20XX_RADIO_FSK_ADDRESS_FILTERING_DISABLED;
     params.header_mode           = FSK_HEADER_MODE;
     params.payload_length_unit   = LR20XX_RADIO_FSK_PAYLOAD_LENGTH_IN_BYTE;
@@ -274,7 +279,7 @@ bool LR2021Manager ::fskInit(U32 freq_hz, I8 power_dbm) {
     // fskTx() / fskRx() re-apply params and syncword per operation.
     const bool rx_is_tc = (this->m_ccsdsRole == CcsdsRole::SPACECRAFT);
     const lr20xx_radio_fsk_pkt_params_t pkt_params =
-        fskPktParams(rx_is_tc ? FSK_CLTU_PKT_LEN : FSK_TM_PKT_LEN);
+        fskPktParams(rx_is_tc ? FSK_CLTU_PKT_LEN : FSK_TM_PKT_LEN, rx_is_tc);
     status = lr20xx_radio_fsk_set_packet_params(this, &pkt_params);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_packet_params failed (%d)", status);
@@ -345,7 +350,7 @@ bool LR2021Manager ::fskTx(const U8* data, U16 len) {
         return false;
     }
 
-    const lr20xx_radio_fsk_pkt_params_t pkt_params = fskPktParams(tx_len);
+    const lr20xx_radio_fsk_pkt_params_t pkt_params = fskPktParams(tx_len, false);
     status = lr20xx_radio_fsk_set_packet_params(this, &pkt_params);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("TX set_packet_params failed (%d)", status);
@@ -372,6 +377,9 @@ bool LR2021Manager ::fskTx(const U8* data, U16 len) {
 
     this->m_txInFlight = true;
     // DEBUG("TX started, %u bytes", len);
+
+    // Sample the antenna coupler RF power detectors while the PA is on.
+    this->rfPowerMeasureTx();
     return true;
 }
 
@@ -391,7 +399,7 @@ bool LR2021Manager ::fskRx(U32 timeout_ms) {
     }
 
     const lr20xx_radio_fsk_pkt_params_t pkt_params =
-        fskPktParams(rx_is_tc ? FSK_CLTU_PKT_LEN : FSK_TM_PKT_LEN);
+        fskPktParams(rx_is_tc ? FSK_CLTU_PKT_LEN : FSK_TM_PKT_LEN, rx_is_tc);
     status = lr20xx_radio_fsk_set_packet_params(this, &pkt_params);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("RX set_packet_params failed (%d)", status);

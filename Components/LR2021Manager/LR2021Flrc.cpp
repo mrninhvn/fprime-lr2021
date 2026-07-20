@@ -179,6 +179,9 @@ bool LR2021Manager ::flrcTx(const U8* data, U16 len) {
 
     this->m_txInFlight = true;
     // DEBUG("TX started, %u bytes", tx_len);
+
+    // Sample the antenna coupler RF power detectors while the PA is on.
+    this->rfPowerMeasureTx();
     return true;
 }
 
