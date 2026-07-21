@@ -217,6 +217,23 @@ lr20xx_radio_fsk_pkt_params_t fskPktParams(uint16_t pld_len, bool long_preamble)
 }
 }  // namespace
 
+bool LR2021Manager ::fskTune(U32 freq_hz) {
+    // Skip the SPI write when the chip is already on this frequency: with a
+    // single-frequency link (TX freq == RX freq) the radio is programmed once
+    // in fskInit and never retunes, so the TX<->RX turnaround has zero extra
+    // cost. A split TX/RX plan retunes only when crossing between channels.
+    if (freq_hz == this->m_progFreqHz) {
+        return true;
+    }
+    lr20xx_status_t status = lr20xx_radio_common_set_rf_freq(this, freq_hz);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("set_rf_freq failed (%d)", status);
+        return false;
+    }
+    this->m_progFreqHz = freq_hz;
+    return true;
+}
+
 bool LR2021Manager ::fskInit(U32 freq_hz, I8 power_dbm) {
     lr20xx_status_t status;
 
@@ -232,11 +249,17 @@ bool LR2021Manager ::fskInit(U32 freq_hz, I8 power_dbm) {
         return false;
     }
 
-    status = lr20xx_radio_common_set_rf_freq(this, freq_hz);
+    // Base frequency for this mode; RX rests here and TX may retune to a
+    // separate channel (see setRxFreq / setTxFreq / fskTune). Program the RX
+    // (rest) frequency now so the radio comes up on the right channel.
+    this->m_freqHz = freq_hz;
+    const U32 rx_freq = this->m_rxFreqHz ? this->m_rxFreqHz : this->m_freqHz;
+    status = lr20xx_radio_common_set_rf_freq(this, rx_freq);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_rf_freq failed (%d)", status);
         return false;
     }
+    this->m_progFreqHz = rx_freq;
 
     // Select the RX path and PA matching the requested band:
     // sub-GHz -> LF path/PA, 2.4 GHz -> HF path/PA.
@@ -369,6 +392,12 @@ bool LR2021Manager ::fskTx(const U8* data, U16 len) {
         return false;
     }
 
+    // Retune to the TX (downlink) channel; no-op when TX shares the RX freq.
+    const U32 tx_freq = this->m_txFreqHz ? this->m_txFreqHz : this->m_freqHz;
+    if (!this->fskTune(tx_freq)) {
+        return false;
+    }
+
     status = lr20xx_radio_common_set_tx(this, FSK_TX_TIMEOUT_MS);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_tx failed (%d)", status);
@@ -409,6 +438,12 @@ bool LR2021Manager ::fskRx(U32 timeout_ms) {
     status = lr20xx_radio_fifo_clear_rx(this);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("fifo_clear_rx failed (%d)", status);
+        return false;
+    }
+
+    // Retune to the RX (uplink / rest) channel; no-op when RX shares the freq.
+    const U32 rx_freq = this->m_rxFreqHz ? this->m_rxFreqHz : this->m_freqHz;
+    if (!this->fskTune(rx_freq)) {
         return false;
     }
 

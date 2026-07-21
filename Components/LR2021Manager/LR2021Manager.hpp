@@ -154,10 +154,27 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! call before setMode(). Defaults to SPACECRAFT.
     void setCcsdsRole(CcsdsRole role) { this->m_ccsdsRole = role; }
 
+    //! Manually set the TX (transmit) RF frequency in Hz. 0 (default) means
+    //! "use the frequency passed to setMode", i.e. TX and RX share one
+    //! frequency. A non-zero value splits the TX channel (the downlink for
+    //! the spacecraft) from RX; keep it in the same band as setMode's
+    //! frequency, since the PA / RX path is selected once at init.
+    void setTxFreq(U32 tx_freq_hz) { this->m_txFreqHz = tx_freq_hz; }
+
+    //! Manually set the RX (receive / rest) RF frequency in Hz. 0 (default)
+    //! means "use the frequency passed to setMode". Same-band constraint as
+    //! setTxFreq(). Takes effect on the next RX; call before setMode().
+    void setRxFreq(U32 rx_freq_hz) { this->m_rxFreqHz = rx_freq_hz; }
+
     //! Configure the radio for FSK: packet type, RF frequency, PA/RX path,
     //! modulation / packet params and syncword.
     //! \return true on success
     bool fskInit(U32 freq_hz, I8 power_dbm);
+
+    //! Program the RF center frequency, skipping the SPI write when the chip
+    //! is already tuned to it (so a single-frequency link never retunes).
+    //! \return true on success
+    bool fskTune(U32 freq_hz);
 
     //! Transmit \p len bytes using FSK
     //! \return true on success
@@ -239,7 +256,10 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
 
     RadioMode m_mode = RadioMode::NONE; //!< Modulation selected by the last successful setMode()
     CcsdsRole m_ccsdsRole = CcsdsRole::SPACECRAFT; //!< CCSDS role on the FSK channel
-    U32 m_freqHz = 0;            //!< RF frequency of the last successful setMode()
+    U32 m_freqHz = 0;            //!< RF frequency of the last successful setMode() (base / default)
+    U32 m_txFreqHz = 0;          //!< TX RF frequency override; 0 = use m_freqHz
+    U32 m_rxFreqHz = 0;          //!< RX RF frequency override; 0 = use m_freqHz
+    U32 m_progFreqHz = 0;        //!< RF frequency currently programmed on the chip
     I8 m_powerDbm = 0;           //!< TX power of the last successful setMode()
     bool m_rxContinuous = false; //!< Re-enter RX automatically after each packet
     bool m_txInFlight = false;   //!< TX started, TX_DONE not yet seen
