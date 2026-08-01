@@ -183,14 +183,14 @@ U16 cltuDecode(const U8* in, U16 in_len, U8* out, U16 out_cap) {
 // is asymmetric: TX prepends one idle octet inside the syncword to dodge
 // the LR2021 TX first-byte corruption; RX matches the bare 0xEB90 so a real
 // ground station is received as-is.
-lr20xx_status_t fskApplySyncword(LR2021Manager* mgr, bool tc_channel, bool is_tx) {
+lr20xx_status_t fskApplySyncword(LR2021Manager::RadioSlot* r, bool tc_channel, bool is_tx) {
     if (!tc_channel) {
-        return lr20xx_radio_fsk_set_syncword(mgr, FSK_TM_SYNCWORD, FSK_TM_SYNCWORD_BITS,
+        return lr20xx_radio_fsk_set_syncword(r, FSK_TM_SYNCWORD, FSK_TM_SYNCWORD_BITS,
                                              LR20XX_RADIO_FSK_SYNCWORD_MSBF);
     }
-    return is_tx ? lr20xx_radio_fsk_set_syncword(mgr, FSK_TC_TX_SYNCWORD, FSK_TC_TX_SYNCWORD_BITS,
+    return is_tx ? lr20xx_radio_fsk_set_syncword(r, FSK_TC_TX_SYNCWORD, FSK_TC_TX_SYNCWORD_BITS,
                                                  LR20XX_RADIO_FSK_SYNCWORD_MSBF)
-                 : lr20xx_radio_fsk_set_syncword(mgr, FSK_TC_RX_SYNCWORD, FSK_TC_RX_SYNCWORD_BITS,
+                 : lr20xx_radio_fsk_set_syncword(r, FSK_TC_RX_SYNCWORD, FSK_TC_RX_SYNCWORD_BITS,
                                                  LR20XX_RADIO_FSK_SYNCWORD_MSBF);
 }
 
@@ -217,82 +217,99 @@ lr20xx_radio_fsk_pkt_params_t fskPktParams(uint16_t pld_len, bool long_preamble)
 }
 }  // namespace
 
-bool LR2021Manager ::fskTune(U32 freq_hz) {
+bool LR2021Manager ::fskTune(RadioSlot& r, U32 freq_hz) {
     // Skip the SPI write when the chip is already on this frequency: with a
     // single-frequency link (TX freq == RX freq) the radio is programmed once
     // in fskInit and never retunes, so the TX<->RX turnaround has zero extra
     // cost. A split TX/RX plan retunes only when crossing between channels.
-    if (freq_hz == this->m_progFreqHz) {
+    if (freq_hz == r.progFreqHz) {
         return true;
     }
-    lr20xx_status_t status = lr20xx_radio_common_set_rf_freq(this, freq_hz);
+    lr20xx_status_t status = lr20xx_radio_common_set_rf_freq(&r, freq_hz);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_rf_freq failed (%d)", status);
         return false;
     }
-    this->m_progFreqHz = freq_hz;
+    r.progFreqHz = freq_hz;
     return true;
 }
 
-bool LR2021Manager ::fskInit(U32 freq_hz, I8 power_dbm) {
+bool LR2021Manager ::fskInit(RadioSlot& r, U32 freq_hz, I8 power_dbm) {
     lr20xx_status_t status;
 
-    status = lr20xx_system_set_standby_mode(this, LR20XX_SYSTEM_STANDBY_MODE_RC);
+    status = lr20xx_system_set_standby_mode(&r, LR20XX_SYSTEM_STANDBY_MODE_RC);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_standby failed (%d)", status);
         return false;
     }
 
-    status = lr20xx_radio_common_set_pkt_type(this, LR20XX_RADIO_COMMON_PKT_TYPE_FSK);
+    status = lr20xx_radio_common_set_pkt_type(&r, LR20XX_RADIO_COMMON_PKT_TYPE_FSK);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_pkt_type failed (%d)", status);
+        return false;
+    }
+
+    // Park in STANDBY_XOSC (TCXO kept running) after each TX/RX instead of
+    // the default STANDBY_RC, which powers the TCXO down. On the NiceRF
+    // module (chip-supplied TCXO) the TX_DONE -> set_rx turnaround
+    // power-cycles the TCXO within ~1 ms and it fails to restart, wedging
+    // the chip with BUSY stuck high. Crystal modules (RY42F) never showed
+    // this because a crystal is not power-cycled.
+    status = lr20xx_radio_common_set_rx_tx_fallback_mode(&r, LR20XX_RADIO_FALLBACK_STDBY_XOSC);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("set_fallback_mode failed (%d)", status);
         return false;
     }
 
     // Base frequency for this mode; RX rests here and TX may retune to a
     // separate channel (see setRxFreq / setTxFreq / fskTune). Program the RX
     // (rest) frequency now so the radio comes up on the right channel.
-    this->m_freqHz = freq_hz;
-    const U32 rx_freq = this->m_rxFreqHz ? this->m_rxFreqHz : this->m_freqHz;
-    status = lr20xx_radio_common_set_rf_freq(this, rx_freq);
+    r.freqHz = freq_hz;
+    const U32 rx_freq = r.rxFreqHz ? r.rxFreqHz : r.freqHz;
+    status = lr20xx_radio_common_set_rf_freq(&r, rx_freq);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_rf_freq failed (%d)", status);
         return false;
     }
-    this->m_progFreqHz = rx_freq;
+    r.progFreqHz = rx_freq;
 
     // Select the RX path and PA matching the requested band:
     // sub-GHz -> LF path/PA, 2.4 GHz -> HF path/PA.
     const bool is_hf = (freq_hz >= 1000000000U);
     status = lr20xx_radio_common_set_rx_path(
-        this, is_hf ? LR20XX_RADIO_COMMON_RX_PATH_HF : LR20XX_RADIO_COMMON_RX_PATH_LF,
+        &r, is_hf ? LR20XX_RADIO_COMMON_RX_PATH_HF : LR20XX_RADIO_COMMON_RX_PATH_LF,
         LR20XX_RADIO_COMMON_RX_PATH_BOOST_MODE_NONE);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_rx_path failed (%d)", status);
         return false;
     }
 
+    // Generic PA operating point. NOTE: on the LF path the FSM PA output is
+    // set by the combination of half_power and duty/slices, so the actual
+    // output does not track power_dbm accurately; replace with a table of
+    // operating points measured on this module once it has been power
+    // calibrated on the bench.
     lr20xx_radio_common_pa_cfg_t pa_cfg = {};
     pa_cfg.pa_sel = is_hf ? LR20XX_RADIO_COMMON_PA_SEL_HF : LR20XX_RADIO_COMMON_PA_SEL_LF;
     pa_cfg.pa_lf_mode = LR20XX_RADIO_COMMON_PA_LF_MODE_FSM;
     pa_cfg.pa_lf_duty_cycle = 6;  // datasheet default duty/slice values
     pa_cfg.pa_lf_slices = 7;
     pa_cfg.pa_hf_duty_cycle = 16;
-    status = lr20xx_radio_common_set_pa_cfg(this, &pa_cfg);
+    status = lr20xx_radio_common_set_pa_cfg(&r, &pa_cfg);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_pa_cfg failed (%d)", status);
         return false;
     }
 
     // set_tx_params takes 0.5 dBm steps.
-    status = lr20xx_radio_common_set_tx_params(this, static_cast<int8_t>(power_dbm * 2),
+    status = lr20xx_radio_common_set_tx_params(&r, static_cast<int8_t>(power_dbm * 2),
                                                LR20XX_RADIO_COMMON_RAMP_96_US);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_tx_params failed (%d)", status);
         return false;
     }
 
-    status = lr20xx_radio_fsk_set_modulation_params(this, &FSK_MOD_PARAMS);
+    status = lr20xx_radio_fsk_set_modulation_params(&r, &FSK_MOD_PARAMS);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_modulation_params failed (%d)", status);
         return false;
@@ -300,16 +317,16 @@ bool LR2021Manager ::fskInit(U32 freq_hz, I8 power_dbm) {
 
     // Configure for the receive channel of this role (the resting state);
     // fskTx() / fskRx() re-apply params and syncword per operation.
-    const bool rx_is_tc = (this->m_ccsdsRole == CcsdsRole::SPACECRAFT);
+    const bool rx_is_tc = (r.ccsdsRole == CcsdsRole::SPACECRAFT);
     const lr20xx_radio_fsk_pkt_params_t pkt_params =
         fskPktParams(rx_is_tc ? FSK_CLTU_PKT_LEN : FSK_TM_PKT_LEN, rx_is_tc);
-    status = lr20xx_radio_fsk_set_packet_params(this, &pkt_params);
+    status = lr20xx_radio_fsk_set_packet_params(&r, &pkt_params);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_packet_params failed (%d)", status);
         return false;
     }
 
-    status = fskApplySyncword(this, rx_is_tc, false);
+    status = fskApplySyncword(&r, rx_is_tc, false);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_syncword failed (%d)", status);
         return false;
@@ -317,31 +334,29 @@ bool LR2021Manager ::fskInit(U32 freq_hz, I8 power_dbm) {
 
     // Clear any stale IRQs before operations start.
     lr20xx_system_irq_mask_t irq = 0;
-    (void)lr20xx_system_get_and_clear_irq_status(this, &irq);
+    (void)lr20xx_system_get_and_clear_irq_status(&r, &irq);
 
-    DEBUG("FSK init OK: %u Hz, %d dBm", static_cast<unsigned>(freq_hz), power_dbm);
-    this->m_mode = RadioMode::FSK;
-    this->m_rxContinuous = false;
-    this->m_txInFlight = false;
-
-    if (this->isConnected_ready_OutputPort(0)) {
-        this->ready_out(0);
-    }
+    DEBUG("radio %d FSK init OK: %u Hz, %d dBm", static_cast<int>(r.idx),
+          static_cast<unsigned>(freq_hz), power_dbm);
+    r.mode = RadioMode::FSK;
+    r.rxContinuous = false;
+    r.txInFlight = false;
+    // Downlink readiness (initial comStatus) is signalled once by setMode().
     return true;
 }
 
-bool LR2021Manager ::fskTx(const U8* data, U16 len) {
+bool LR2021Manager ::fskTx(RadioSlot& r, const U8* data, U16 len) {
     // SPACECRAFT transmits TM frames; GROUND transmits TC frames as CLTUs.
-    const bool tx_is_tc = (this->m_ccsdsRole == CcsdsRole::GROUND);
+    const bool tx_is_tc = (r.ccsdsRole == CcsdsRole::GROUND);
     const U16 max_data = tx_is_tc ? FSK_CLTU_DATA_CAP : FSK_TM_DATA_CAP;
-    if ((this->m_mode != RadioMode::FSK) || (data == nullptr) || (len == 0) ||
+    if ((r.mode != RadioMode::FSK) || (data == nullptr) || (len == 0) ||
         (len > max_data)) {
         return false;
     }
 
     // Refuse while a TX is in flight (cleared by TX_DONE / error in
     // fskService). Lets callers retry from a periodic loop safely.
-    if (this->m_txInFlight) {
+    if (r.txInFlight) {
         return false;
     }
 
@@ -367,61 +382,89 @@ bool LR2021Manager ::fskTx(const U8* data, U16 len) {
         }
     }
 
-    lr20xx_status_t status = fskApplySyncword(this, tx_is_tc, true);
+    lr20xx_status_t status = fskApplySyncword(&r, tx_is_tc, true);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("TX set_syncword failed (%d)", status);
         return false;
     }
 
     const lr20xx_radio_fsk_pkt_params_t pkt_params = fskPktParams(tx_len, false);
-    status = lr20xx_radio_fsk_set_packet_params(this, &pkt_params);
+    status = lr20xx_radio_fsk_set_packet_params(&r, &pkt_params);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("TX set_packet_params failed (%d)", status);
         return false;
     }
 
-    status = lr20xx_radio_fifo_clear_tx(this);
+    status = lr20xx_radio_fifo_clear_tx(&r);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("fifo_clear_tx failed (%d)", status);
         return false;
     }
 
-    status = lr20xx_radio_fifo_write_tx(this, payload, tx_len);
+    status = lr20xx_radio_fifo_write_tx(&r, payload, tx_len);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("fifo_write_tx failed (%d)", status);
         return false;
     }
 
     // Retune to the TX (downlink) channel; no-op when TX shares the RX freq.
-    const U32 tx_freq = this->m_txFreqHz ? this->m_txFreqHz : this->m_freqHz;
-    if (!this->fskTune(tx_freq)) {
+    const U32 tx_freq = r.txFreqHz ? r.txFreqHz : r.freqHz;
+    if (!this->fskTune(r, tx_freq)) {
         return false;
     }
 
-    status = lr20xx_radio_common_set_tx(this, FSK_TX_TIMEOUT_MS);
+    status = lr20xx_radio_common_set_tx(&r, FSK_TX_TIMEOUT_MS);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_tx failed (%d)", status);
         return false;
     }
 
-    this->m_txInFlight = true;
-    // DEBUG("TX started, %u bytes", len);
+    r.txInFlight = true;
+    DEBUG("radio %d TX started, %u bytes", static_cast<int>(r.idx), len);
 
     // Sample the antenna coupler RF power detectors while the PA is on.
     this->rfPowerMeasureTx();
     return true;
 }
 
-bool LR2021Manager ::fskRx(U32 timeout_ms) {
-    if (this->m_mode != RadioMode::FSK) {
+bool LR2021Manager ::fskRx(RadioSlot& r, U32 timeout_ms) {
+    if (r.mode != RadioMode::FSK) {
+        return false;
+    }
+
+    // Post-TX the chip spontaneously holds BUSY high for a while (variable
+    // onset, >100 ms observed on the NiceRF module at 437 MHz) before it can
+    // take another command; the default 100 ms HAL timeout then fails the
+    // first reconfiguration command. Give it a long grace period here and
+    // log when it stays wedged (diagnostic for the PA-shutdown transient).
+    if (!this->waitOnBusy(r.idx, 2000000)) {
+        DEBUG("BUSY never released after previous op (2 s)");
+        return false;
+    }
+
+    // Force standby before reconfiguring for RX. XOSC standby, not RC: RC
+    // powers the TCXO down and the immediate TX_DONE -> set_rx turnaround
+    // then power-cycles it faster than it can restart (see the fallback-mode
+    // note in fskInit).
+    lr20xx_status_t status = lr20xx_system_set_standby_mode(&r, LR20XX_SYSTEM_STANDBY_MODE_XOSC);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("RX set_standby failed (%d)", status);
+        return false;
+    }
+    // The FIRST entry into XOSC standby cold-starts the TCXO and the chip
+    // holds BUSY for the full configured start window; the default 100 ms
+    // pre-command timeout of the next command would trip on it. Once warm
+    // (fallback keeps the TCXO running) this returns immediately.
+    if (!this->waitOnBusy(r.idx, 2500000)) {
+        DEBUG("XOSC standby entry timed out");
         return false;
     }
 
     // Restore the receive-channel configuration of this role (a TX may have
     // switched the syncword / packet length to the transmit channel).
     // SPACECRAFT receives TC CLTUs; GROUND receives TM frames.
-    const bool rx_is_tc = (this->m_ccsdsRole == CcsdsRole::SPACECRAFT);
-    lr20xx_status_t status = fskApplySyncword(this, rx_is_tc, false);
+    const bool rx_is_tc = (r.ccsdsRole == CcsdsRole::SPACECRAFT);
+    status = fskApplySyncword(&r, rx_is_tc, false);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("RX set_syncword failed (%d)", status);
         return false;
@@ -429,53 +472,52 @@ bool LR2021Manager ::fskRx(U32 timeout_ms) {
 
     const lr20xx_radio_fsk_pkt_params_t pkt_params =
         fskPktParams(rx_is_tc ? FSK_CLTU_PKT_LEN : FSK_TM_PKT_LEN, rx_is_tc);
-    status = lr20xx_radio_fsk_set_packet_params(this, &pkt_params);
+    status = lr20xx_radio_fsk_set_packet_params(&r, &pkt_params);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("RX set_packet_params failed (%d)", status);
         return false;
     }
 
-    status = lr20xx_radio_fifo_clear_rx(this);
+    status = lr20xx_radio_fifo_clear_rx(&r);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("fifo_clear_rx failed (%d)", status);
         return false;
     }
 
     // Retune to the RX (uplink / rest) channel; no-op when RX shares the freq.
-    const U32 rx_freq = this->m_rxFreqHz ? this->m_rxFreqHz : this->m_freqHz;
-    if (!this->fskTune(rx_freq)) {
+    const U32 rx_freq = r.rxFreqHz ? r.rxFreqHz : r.freqHz;
+    if (!this->fskTune(r, rx_freq)) {
         return false;
     }
 
     if (timeout_ms == 0) {
-        status = lr20xx_radio_common_set_rx_with_timeout_in_rtc_step(this, FSK_RX_CONTINUOUS);
+        status = lr20xx_radio_common_set_rx_with_timeout_in_rtc_step(&r, FSK_RX_CONTINUOUS);
     } else {
-        status = lr20xx_radio_common_set_rx(this, timeout_ms);
+        status = lr20xx_radio_common_set_rx(&r, timeout_ms);
     }
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_rx failed (%d)", status);
         return false;
     }
 
-    this->m_rxContinuous = (timeout_ms == 0);
-    // DEBUG("RX started (%s)", this->m_rxContinuous ? "continuous" : "timeout");
+    r.rxContinuous = (timeout_ms == 0);
     return true;
 }
 
-void LR2021Manager ::fskService() {
-    if (this->m_mode != RadioMode::FSK) {
+void LR2021Manager ::fskService(RadioSlot& r) {
+    if (r.mode != RadioMode::FSK) {
         return;
     }
 
-    // DIO7 is configured as the IRQ output: skip the SPI status poll while
-    // the line is low (irqPending() returns true when the port is unwired,
+    // The radio's IRQ line gates the SPI status poll: skip it while the
+    // line is low (irqPending() returns true when the port is unwired,
     // falling back to pure SPI polling).
-    if (!this->irqPending()) {
+    if (!this->irqPending(r.idx)) {
         return;
     }
 
     lr20xx_system_irq_mask_t irq = 0;
-    if (lr20xx_system_get_and_clear_irq_status(this, &irq) != LR20XX_STATUS_OK) {
+    if (lr20xx_system_get_and_clear_irq_status(&r, &irq) != LR20XX_STATUS_OK) {
         return;
     }
     if (irq == LR20XX_SYSTEM_IRQ_NONE) {
@@ -483,35 +525,33 @@ void LR2021Manager ::fskService() {
     }
 
     if ((irq & LR20XX_SYSTEM_IRQ_TX_DONE) != 0) {
-        this->m_txInFlight = false;
+        r.txInFlight = false;
         this->m_fskTxCount++;
         this->tlmWrite_FskTxCount(this->m_fskTxCount);
-        // this->log_ACTIVITY_HI_FskTxDone();
-        DEBUG("TX done, %llu bytes", this->m_workingBuffer.getSize());
-        if (this->isConnected_asyncSendReturnIn_OutputPort(0)) {
-            Fw::Buffer buffer = m_workingBuffer;
-            m_workingBuffer = Fw::Buffer();
-            this->asyncSendReturnIn_out(0, buffer, Drv::ByteStreamStatus::OP_OK);
-        }
-        this->fskRx(0);
+        // this->log_ACTIVITY_HI_FskTxDone(static_cast<U8>(r.idx));
+        DEBUG("radio %d TX done, %llu bytes", static_cast<int>(r.idx), r.workingBuffer.getSize());
+        // Only a TX that owns an F Prime buffer returns one (and grants the
+        // next comStatus credit).
+        this->txComplete(r, Fw::Success::SUCCESS);
+        this->fskRx(r, 0);
     }
 
     if ((irq & LR20XX_SYSTEM_IRQ_RX_DONE) != 0) {
         uint16_t pkt_len = 0;
-        (void)lr20xx_radio_common_get_rx_packet_length(this, &pkt_len);
+        (void)lr20xx_radio_common_get_rx_packet_length(&r, &pkt_len);
         if (pkt_len > FSK_MAX_PAYLOAD) {
             pkt_len = FSK_MAX_PAYLOAD;
         }
 
         lr20xx_radio_fsk_packet_status_t pkt_status = {};
-        (void)lr20xx_radio_fsk_get_packet_status(this, &pkt_status);
+        (void)lr20xx_radio_fsk_get_packet_status(&r, &pkt_status);
 
         U8 payload[FSK_MAX_PAYLOAD] = {0};
         U8 decoded[FSK_CLTU_DATA_CAP];
         const U8* out_data = payload;
         U16 out_len = 0;
-        if ((pkt_len > 0) && (lr20xx_radio_fifo_read_rx(this, payload, pkt_len) == LR20XX_STATUS_OK)) {
-            if (this->m_ccsdsRole == CcsdsRole::SPACECRAFT) {
+        if ((pkt_len > 0) && (lr20xx_radio_fifo_read_rx(&r, payload, pkt_len) == LR20XX_STATUS_OK)) {
+            if (r.ccsdsRole == CcsdsRole::SPACECRAFT) {
                 this->logHex("CLTU raw", payload, 4);
                 // TC uplink capture: decode the CLTU codeblocks; the recovered
                 // bytes (TC frame + fill) go to the FrameAccumulator, which
@@ -541,23 +581,26 @@ void LR2021Manager ::fskService() {
             if (recv_buffer.getData()) {
                 memcpy(recv_buffer.getData(), out_data, out_len);
                 recv_buffer.setSize(out_len);
-                this->recv_out(0, recv_buffer, Drv::ByteStreamStatus::OP_OK);
+                // Uplink bytes carry no frame context yet: the accumulator
+                // extracts frames from the stream and ignores it.
+                ComCfg::FrameContext emptyContext;
+                this->dataOut_out(0, recv_buffer, emptyContext);
             }
         }
 
         this->m_fskRxCount++;
         this->tlmWrite_FskRxCount(this->m_fskRxCount);
         this->tlmWrite_FskRssi(pkt_status.rssi_sync_in_dbm);
-        this->log_ACTIVITY_HI_FskRxPacket(out_len, pkt_status.rssi_sync_in_dbm);
-        this->fskRx(0);
+        this->log_ACTIVITY_HI_FskRxPacket(static_cast<U8>(r.idx), out_len, pkt_status.rssi_sync_in_dbm);
+        this->fskRx(r, 0);
     }
 
     const U32 error_mask =
         LR20XX_SYSTEM_IRQ_TIMEOUT | LR20XX_SYSTEM_IRQ_CRC_ERROR | LR20XX_SYSTEM_IRQ_LEN_ERROR;
     if ((irq & error_mask) != 0) {
         // A TX timeout also ends any in-flight transmission.
-        this->m_txInFlight = false;
-        this->log_WARNING_HI_FskError(static_cast<U32>(irq));
+        r.txInFlight = false;
+        this->log_WARNING_HI_FskError(static_cast<U8>(r.idx), static_cast<U32>(irq));
     }
 }
 

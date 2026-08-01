@@ -8,9 +8,13 @@ module LR2021 {
         ReflDbmX10: I16  @< Reflected power [deci-dBm] at the detector input
     }
 
-    @ F Prime manager for the Semtech LR2021 (LR20xx) transceiver.
-    @ Wraps the lr20xx_driver C driver and drives it over a Zephyr SPI bus
-    @ plus reset / busy GPIO lines.
+    @ F Prime manager for the Semtech LR2021 (LR20xx) transceivers.
+    @ Manages both radio modules of the board on the shared SPI bus: each
+    @ module has its own chip select and GPIO set. Both radios rest in
+    @ continuous RX on their own frequency. The component implements the
+    @ Svc.Com adapter interface directly (no ComStub): each downlink frame
+    @ is routed to a radio by its frame context comQueueIndex through a
+    @ route table configured from the topology (setTxRoute).
     active component LR2021Manager {
 
         # ----------------------------------------------------------------------
@@ -23,20 +27,26 @@ module LR2021 {
             FSK @< GMSK Frequency Shift Keying
         }
 
-        @ Port invoked when the driver is ready to send/receive data
-        output port ready: Drv.ByteStreamReady
+        # ----------------------------------------------------------------------
+        # Com adapter interface (Svc.Com), routed by frame context.
+        # dataIn is async (the interface declares it sync) so the slow radio
+        # TX path runs on this component's thread, serialized with run().
+        # ----------------------------------------------------------------------
 
-        @ Port invoked by the driver when it receives data
-        output port $recv: Drv.ByteStreamData
+        @ Downlink frame to transmit; routed to a radio by context.comQueueIndex
+        async input port dataIn: Svc.ComDataWithContext
 
-        @ Port receiving back ownership of data sent out on $recv port
-        guarded input port recvReturnIn: Fw.BufferSend
+        @ Returns ownership of dataIn frames after TX (or on drop)
+        output port dataReturnOut: Svc.ComDataWithContext
 
-        @ ComStub async
-        async input port asyncSendIn: Fw.BufferSend
+        @ Com status to the framer: ready / TX success / failure
+        output port comStatusOut: Fw.SuccessCondition
 
-        @ ComStub return buffer
-        output port asyncSendReturnIn: Drv.ByteStreamData
+        @ Received (uplink) data, from any radio, to the frame accumulator
+        output port dataOut: Svc.ComDataWithContext
+
+        @ Receives back ownership of buffers sent on dataOut
+        sync input port dataReturnIn: Svc.ComDataWithContext
 
         @Allocate new buffer
         output port allocate: Fw.BufferGet
@@ -48,14 +58,17 @@ module LR2021 {
         # Commands
         # ----------------------------------------------------------------------
 
-        @ Reset the LR2021 radio and re-initialise it, restoring the active mode
-        async command RESET
+        @ Reset one radio and re-initialise it, restoring its active mode
+        async command RESET(
+            radio: U8 @< Radio index (0 or 1)
+        )
 
-        @ Switch the active modulation at runtime (re-initialises the radio
-        @ and enters continuous RX)
+        @ Switch the active modulation of one radio at runtime
+        @ (re-initialises the radio and enters continuous RX)
         async command SET_MODE(
+            radio: U8 @< Radio index (0 or 1)
             mode: Mode @< Modulation to activate
-            freq_hz: U32 @< RF centre frequency in Hz (e.g. 2444000000)
+            freq_hz: U32 @< RF centre frequency in Hz (e.g. 437000000)
             power_dbm: I8 @< TX output power in dBm
         )
 
@@ -67,34 +80,44 @@ module LR2021 {
         event LR2021(msg: string size 128) severity diagnostic format "{}"
 
         @ HAL / SPI operation failed
-        event HalError(status: I32) severity warning high \
-            format "LR2021 HAL error: {}" throttle 5
+        event HalError(radio: U8, status: I32) severity warning high \
+            format "LR2021 radio {} HAL error: {}" throttle 5
 
         @ Radio mode changed
-        event ModeSet(mode: Mode) severity activity high \
-            format "Radio mode set to {}"
+        event ModeSet(radio: U8, mode: Mode) severity activity high \
+            format "Radio {} mode set to {}"
+
+        @ Invalid radio index in a command
+        event BadRadioIndex(radio: U8) severity warning low \
+            format "Invalid radio index {}"
+
+        @ A downlink frame could not be transmitted and was dropped
+        event TxFrameDropped(radio: U8) severity warning high \
+            format "TX frame dropped (radio {} not ready)" throttle 5
 
         @ FLRC packet transmission completed
-        event FlrcTxDone() severity activity high format "FLRC TX done"
+        event FlrcTxDone(radio: U8) severity activity high \
+            format "FLRC TX done (radio {})"
 
         @ FLRC packet received
-        event FlrcRxPacket(length: U16, rssi: I16) severity activity high \
-            format "FLRC RX packet: {} bytes, RSSI {} dBm"
+        event FlrcRxPacket(radio: U8, length: U16, rssi: I16) severity activity high \
+            format "FLRC RX packet (radio {}): {} bytes, RSSI {} dBm"
 
         @ FLRC radio error (timeout / CRC / length), raw IRQ mask
-        event FlrcError(irq: U32) severity warning high \
-            format "FLRC radio error, IRQ mask 0x{x}" throttle 5
+        event FlrcError(radio: U8, irq: U32) severity warning high \
+            format "FLRC radio {} error, IRQ mask 0x{x}" throttle 5
 
         @ FSK packet transmission completed
-        event FskTxDone() severity activity high format "FSK TX done"
+        event FskTxDone(radio: U8) severity activity high \
+            format "FSK TX done (radio {})"
 
         @ FSK packet received
-        event FskRxPacket(length: U16, rssi: I16) severity activity high \
-            format "FSK RX packet: {} bytes, RSSI {} dBm"
+        event FskRxPacket(radio: U8, length: U16, rssi: I16) severity activity high \
+            format "FSK RX packet (radio {}): {} bytes, RSSI {} dBm"
 
         @ FSK radio error (timeout / CRC / length), raw IRQ mask
-        event FskError(irq: U32) severity warning high \
-            format "FSK radio error, IRQ mask 0x{x}" throttle 5
+        event FskError(radio: U8, irq: U32) severity warning high \
+            format "FSK radio {} error, IRQ mask 0x{x}" throttle 5
 
         # ----------------------------------------------------------------------
         # Telemetry
@@ -135,22 +158,25 @@ module LR2021 {
         @ operation (busy-wait) blocks the thread; missing one is harmless.
         async input port run: Svc.Sched drop
 
-        @ SPI bus port (connected to a ZephyrSpiDriver instance)
-        output port spiWriteRead: Drv.SpiWriteRead
+        # Hardware port arrays: index = radio index (0 / 1), each element
+        # wired to that module's SPI chip-select / GPIO driver.
 
-        @ Power GPIO control, active high
-        output port powerGpioWrite: Drv.GpioWrite
+        @ SPI bus ports (each a ZephyrSpiDriver with that radio's chip select)
+        output port spiWriteRead: [2] Drv.SpiWriteRead
+
+        @ Power (load-switch EN) GPIO control, active high
+        output port powerGpioWrite: [2] Drv.GpioWrite
 
         @ Reset (NRESET) GPIO control, active low
-        output port resetGpioWrite: Drv.GpioWrite
+        output port resetGpioWrite: [2] Drv.GpioWrite
 
-        @ BUSY line, read to know when the radio is ready for a command
-        output port busyGpioRead: Drv.GpioRead
+        @ BUSY lines, read to know when the radio can take a command
+        output port busyGpioRead: [2] Drv.GpioRead
 
-        @ IRQ line (radio DIO7). Read from the run handler to skip the SPI
-        @ IRQ-status poll when no IRQ is pending. Optional: when unconnected
-        @ the component polls IRQ status over SPI every run tick.
-        output port irqGpioRead: Drv.GpioRead
+        @ IRQ lines. Read from the run handler to skip the SPI IRQ-status
+        @ poll when no IRQ is pending. Optional: when unconnected the
+        @ component polls IRQ status over SPI every run tick.
+        output port irqGpioRead: [2] Drv.GpioRead
 
         # ----------------------------------------------------------------------
         # Standard AC Ports: Required for Channels, Events, Commands, Parameters

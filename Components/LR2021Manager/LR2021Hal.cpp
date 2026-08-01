@@ -7,6 +7,11 @@
 // forward every radio access to the LR2021Manager F Prime component, which in
 // turn drives the Zephyr SPI bus and the reset / busy GPIOs.
 //
+// The driver's opaque `context` pointer is a LR2021Manager::RadioSlot
+// (every lr20xx_* call in the component passes &m_radio[i]); the slot
+// carries the manager back-pointer plus the radio index, which selects the
+// SPI chip select / GPIO port set of that module on the shared bus.
+//
 // SPI transport notes (see lr20xx_hal.h for the full contract):
 //   * The Zephyr SPI port performs one full-duplex transfer per call, with a
 //     single NSS assert/deassert and equal-length TX/RX buffers.
@@ -22,19 +27,24 @@ extern "C" {
 #include "lr20xx_hal.h"
 }
 
-using LR2021::g_lr2021_manager;
-
 namespace {
+
+using RadioSlot = LR2021::LR2021Manager::RadioSlot;
 
 //! Maximum bytes handled in a single transfer (matches HAL_BUFFER_SIZE).
 constexpr uint16_t HAL_BUF_SIZE = LR2021::LR2021Manager::HAL_BUFFER_SIZE;
 
-//! Run one full-duplex transfer through the manager.
-lr20xx_hal_status_t hal_xfer(const uint8_t* tx, uint8_t* rx, uint16_t len) {
-    if ((g_lr2021_manager == nullptr) || (len == 0)) {
+//! Recover the radio slot from the driver's opaque context pointer.
+RadioSlot* slot(const void* context) {
+    return static_cast<RadioSlot*>(const_cast<void*>(context));
+}
+
+//! Run one full-duplex transfer through the slot's manager / port set.
+lr20xx_hal_status_t hal_xfer(RadioSlot* r, const uint8_t* tx, uint8_t* rx, uint16_t len) {
+    if ((r == nullptr) || (r->mgr == nullptr) || (len == 0)) {
         return LR20XX_HAL_STATUS_ERROR;
     }
-    return g_lr2021_manager->spiTransfer(tx, rx, len) ? LR20XX_HAL_STATUS_OK : LR20XX_HAL_STATUS_ERROR;
+    return r->mgr->spiTransfer(r->idx, tx, rx, len) ? LR20XX_HAL_STATUS_OK : LR20XX_HAL_STATUS_ERROR;
 }
 
 }  // namespace
@@ -42,30 +52,30 @@ lr20xx_hal_status_t hal_xfer(const uint8_t* tx, uint8_t* rx, uint16_t len) {
 extern "C" {
 
 lr20xx_hal_status_t lr20xx_hal_reset(const void* context) {
-    (void)context;
-    if (g_lr2021_manager == nullptr) {
+    RadioSlot* r = slot(context);
+    if ((r == nullptr) || (r->mgr == nullptr)) {
         return LR20XX_HAL_STATUS_ERROR;
     }
-    g_lr2021_manager->halReset();
+    r->mgr->halReset(r->idx);
     return LR20XX_HAL_STATUS_OK;
 }
 
 lr20xx_hal_status_t lr20xx_hal_wakeup(const void* context) {
-    (void)context;
-    if (g_lr2021_manager == nullptr) {
+    RadioSlot* r = slot(context);
+    if ((r == nullptr) || (r->mgr == nullptr)) {
         return LR20XX_HAL_STATUS_ERROR;
     }
-    return g_lr2021_manager->halWakeup() ? LR20XX_HAL_STATUS_OK : LR20XX_HAL_STATUS_ERROR;
+    return r->mgr->halWakeup(r->idx) ? LR20XX_HAL_STATUS_OK : LR20XX_HAL_STATUS_ERROR;
 }
 
 lr20xx_hal_status_t lr20xx_hal_write(const void* context, const uint8_t* command, const uint16_t command_length,
                                      const uint8_t* data, const uint16_t data_length) {
-    (void)context;
-    if (g_lr2021_manager == nullptr) {
+    RadioSlot* r = slot(context);
+    if ((r == nullptr) || (r->mgr == nullptr)) {
         return LR20XX_HAL_STATUS_ERROR;
     }
     // The radio must be ready before it can accept a command.
-    if (!g_lr2021_manager->waitOnBusy()) {
+    if (!r->mgr->waitOnBusy(r->idx)) {
         return LR20XX_HAL_STATUS_ERROR;
     }
 
@@ -80,16 +90,16 @@ lr20xx_hal_status_t lr20xx_hal_write(const void* context, const uint8_t* command
     if (data_length > 0) {
         std::memcpy(txbuf + command_length, data, data_length);
     }
-    return hal_xfer(txbuf, rxbuf, total);
+    return hal_xfer(r, txbuf, rxbuf, total);
 }
 
 lr20xx_hal_status_t lr20xx_hal_read(const void* context, const uint8_t* command, const uint16_t command_length,
                                     uint8_t* data, const uint16_t data_length) {
-    (void)context;
-    if (g_lr2021_manager == nullptr) {
+    RadioSlot* r = slot(context);
+    if ((r == nullptr) || (r->mgr == nullptr)) {
         return LR20XX_HAL_STATUS_ERROR;
     }
-    if (!g_lr2021_manager->waitOnBusy()) {
+    if (!r->mgr->waitOnBusy(r->idx)) {
         DEBUG("waitOnBusy failed before command write\n");
         return LR20XX_HAL_STATUS_ERROR;
     }
@@ -102,13 +112,13 @@ lr20xx_hal_status_t lr20xx_hal_read(const void* context, const uint8_t* command,
     uint8_t txbuf[HAL_BUF_SIZE];
     uint8_t rxbuf[HAL_BUF_SIZE];
     std::memcpy(txbuf, command, command_length);
-    lr20xx_hal_status_t status = hal_xfer(txbuf, rxbuf, command_length);
+    lr20xx_hal_status_t status = hal_xfer(r, txbuf, rxbuf, command_length);
     if (status != LR20XX_HAL_STATUS_OK) {
         return status;
     }
 
     // The radio needs time to prepare the response after the command.
-    if (!g_lr2021_manager->waitOnBusy()) {
+    if (!r->mgr->waitOnBusy(r->idx)) {
         DEBUG("waitOnBusy failed after command write\n");
         return LR20XX_HAL_STATUS_ERROR;
     }
@@ -123,7 +133,7 @@ lr20xx_hal_status_t lr20xx_hal_read(const void* context, const uint8_t* command,
         return LR20XX_HAL_STATUS_ERROR;
     }
     std::memset(txbuf, 0, total);
-    status = hal_xfer(txbuf, rxbuf, total);
+    status = hal_xfer(r, txbuf, rxbuf, total);
     if (status != LR20XX_HAL_STATUS_OK) {
         return status;
     }
@@ -132,13 +142,13 @@ lr20xx_hal_status_t lr20xx_hal_read(const void* context, const uint8_t* command,
 }
 
 lr20xx_hal_status_t lr20xx_hal_direct_read(const void* context, uint8_t* data, const uint16_t data_length) {
-    (void)context;
     // Simple SS / read / nSS operation (used by lr20xx_system_get_status). The
     // Semtech reference waits for the radio to be ready first.
-    if (g_lr2021_manager == nullptr) {
+    RadioSlot* r = slot(context);
+    if ((r == nullptr) || (r->mgr == nullptr)) {
         return LR20XX_HAL_STATUS_ERROR;
     }
-    if (!g_lr2021_manager->waitOnBusy()) {
+    if (!r->mgr->waitOnBusy(r->idx)) {
         return LR20XX_HAL_STATUS_ERROR;
     }
     if (data_length > HAL_BUF_SIZE) {
@@ -146,17 +156,17 @@ lr20xx_hal_status_t lr20xx_hal_direct_read(const void* context, uint8_t* data, c
     }
     uint8_t txbuf[HAL_BUF_SIZE];
     std::memset(txbuf, 0, data_length);
-    return hal_xfer(txbuf, data, data_length);
+    return hal_xfer(r, txbuf, data, data_length);
 }
 
 lr20xx_hal_status_t lr20xx_hal_direct_read_fifo(const void* context, const uint8_t* command,
                                                 const uint16_t command_length, uint8_t* data,
                                                 const uint16_t data_length) {
-    (void)context;
-    if (g_lr2021_manager == nullptr) {
+    RadioSlot* r = slot(context);
+    if ((r == nullptr) || (r->mgr == nullptr)) {
         return LR20XX_HAL_STATUS_ERROR;
     }
-    if (!g_lr2021_manager->waitOnBusy()) {
+    if (!r->mgr->waitOnBusy(r->idx)) {
         return LR20XX_HAL_STATUS_ERROR;
     }
 
@@ -170,7 +180,7 @@ lr20xx_hal_status_t lr20xx_hal_direct_read_fifo(const void* context, const uint8
     uint8_t rxbuf[HAL_BUF_SIZE];
     std::memcpy(txbuf, command, command_length);
     std::memset(txbuf + command_length, 0, data_length);
-    lr20xx_hal_status_t status = hal_xfer(txbuf, rxbuf, total);
+    lr20xx_hal_status_t status = hal_xfer(r, txbuf, rxbuf, total);
     if (status != LR20XX_HAL_STATUS_OK) {
         return status;
     }

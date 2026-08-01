@@ -15,71 +15,79 @@ extern "C" {
 
 namespace LR2021 {
 
-// Global instance pointer, consumed by the C HAL bridge (LR2021Hal.cpp)
-LR2021Manager* g_lr2021_manager = nullptr;
-
 // ----------------------------------------------------------------------
 // Component construction and destruction
 // ----------------------------------------------------------------------
 
+// The C HAL bridge (LR2021Hal.cpp) reaches the component through the
+// driver's context pointer: every lr20xx_* call passes &m_radio[i], and the
+// slot carries the back-pointer plus the radio index.
 LR2021Manager ::LR2021Manager(const char* const compName) : LR2021ManagerComponentBase(compName) {
-    g_lr2021_manager = this;
+    for (FwIndexType i = 0; i < NUM_RADIOS; i++) {
+        this->m_radio[i].mgr = this;
+        this->m_radio[i].idx = i;
+    }
 }
 
 LR2021Manager ::~LR2021Manager() {}
 
 // ----------------------------------------------------------------------
-// Helpers used by the HAL bridge
+// Helpers used by the HAL bridge. The hardware ports are arrays indexed by
+// the radio index, so dispatch is a direct port-number selection.
 // ----------------------------------------------------------------------
 
-bool LR2021Manager ::spiTransfer(const U8* tx, U8* rx, U16 len) {
+bool LR2021Manager ::spiTransfer(FwIndexType idx, const U8* tx, U8* rx, U16 len) {
     FW_ASSERT(tx != nullptr);
     FW_ASSERT(rx != nullptr);
     FW_ASSERT(len > 0, static_cast<FwAssertArgType>(len));
+    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
 
-    if (!this->isConnected_spiWriteRead_OutputPort(0)) {
+    if (!this->isConnected_spiWriteRead_OutputPort(idx)) {
         return false;
     }
 
     Fw::Buffer writeBuffer(const_cast<U8*>(tx), len);
     Fw::Buffer readBuffer(rx, len);
-    Drv::SpiStatus status = this->spiWriteRead_out(0, writeBuffer, readBuffer);
+    Drv::SpiStatus status = this->spiWriteRead_out(idx, writeBuffer, readBuffer);
     if (status != Drv::SpiStatus::SPI_OK) {
         Fw::LogStringArg msg;
-        msg.format("SPI transfer failed (status=%d, len=%u)", static_cast<int>(status.e), len);
+        msg.format("SPI transfer failed (radio=%d, status=%d, len=%u)", static_cast<int>(idx),
+                   static_cast<int>(status.e), len);
         this->log_DIAGNOSTIC_LR2021(msg);
         return false;
     }
     return true;
 }
 
-void LR2021Manager ::halReset() {
-    if (!this->isConnected_resetGpioWrite_OutputPort(0)) {
+void LR2021Manager ::halReset(FwIndexType idx) {
+    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
+    if (!this->isConnected_resetGpioWrite_OutputPort(idx)) {
         return;
     }
     // NRESET is active low and the GPIO is declared GPIO_ACTIVE_LOW, so the
     // F Prime logic level is the *logical* reset state (the driver inverts it):
     //   Fw::Logic::HIGH -> reset asserted (line driven low)
     //   Fw::Logic::LOW  -> reset released (line driven high)
-    this->resetGpioWrite_out(0, Fw::Logic::HIGH);  // assert reset
+    this->resetGpioWrite_out(idx, Fw::Logic::HIGH);  // assert reset
     this->delayMs(5);
-    this->resetGpioWrite_out(0, Fw::Logic::LOW);   // release reset
+    this->resetGpioWrite_out(idx, Fw::Logic::LOW);   // release reset
     this->delayMs(10);
     // Wait until the radio finishes its start-up sequence.
-    (void)this->waitOnBusy();
+    (void)this->waitOnBusy(idx);
 }
 
-bool LR2021Manager ::halWakeup() {
+bool LR2021Manager ::halWakeup(FwIndexType idx) {
     // A NSS falling edge wakes the radio; issue a short dummy transfer to
     // generate one, then wait for BUSY to fall.
     U8 dummy = 0;
-    (void)this->spiTransfer(&dummy, &dummy, 1);
-    return this->waitOnBusy();
+    (void)this->spiTransfer(idx, &dummy, &dummy, 1);
+    return this->waitOnBusy(idx);
 }
 
-bool LR2021Manager ::waitOnBusy(U32 timeout_us) {
+bool LR2021Manager ::waitOnBusy(FwIndexType idx, U32 timeout_us) {
+    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
     // Without a BUSY line connected we cannot poll; assume the radio is ready.
-    if (!this->isConnected_busyGpioRead_OutputPort(0)) {
+    if (!this->isConnected_busyGpioRead_OutputPort(idx)) {
         return true;
     }
 
@@ -87,7 +95,7 @@ bool LR2021Manager ::waitOnBusy(U32 timeout_us) {
     U32 elapsed_us = 0;
     Fw::Logic state = Fw::Logic::HIGH;
     do {
-        Drv::GpioStatus status = this->busyGpioRead_out(0, state);
+        Drv::GpioStatus status = this->busyGpioRead_out(idx, state);
         if (status != Drv::GpioStatus::OP_OK) {
             return false;
         }
@@ -101,29 +109,31 @@ bool LR2021Manager ::waitOnBusy(U32 timeout_us) {
     // Timed out: the radio never lowered BUSY. Usually means it is held in
     // reset, unpowered, or the BUSY line is miswired.
     Fw::LogStringArg msg;
-    msg.format("BUSY stuck high; radio not ready (timeout %u us)", timeout_us);
+    msg.format("radio %d BUSY stuck high; not ready (timeout %u us)", static_cast<int>(idx), timeout_us);
     this->log_DIAGNOSTIC_LR2021(msg);
     return false;
 }
 
-bool LR2021Manager ::irqPending() {
+bool LR2021Manager ::irqPending(FwIndexType idx) {
+    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
     // Without an IRQ line connected the caller must poll over SPI.
-    if (!this->isConnected_irqGpioRead_OutputPort(0)) {
+    if (!this->isConnected_irqGpioRead_OutputPort(idx)) {
         return true;
     }
     Fw::Logic state = Fw::Logic::LOW;
-    if (this->irqGpioRead_out(0, state) != Drv::GpioStatus::OP_OK) {
+    if (this->irqGpioRead_out(idx, state) != Drv::GpioStatus::OP_OK) {
         return true;  // read failed: fall back to the SPI poll
     }
     return state == Fw::Logic::HIGH;
 }
 
-void LR2021Manager ::chipVersion() {
+void LR2021Manager ::chipVersion(FwIndexType idx) {
+    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
     lr20xx_system_version_t version = {0, 0};
-    lr20xx_status_t status = lr20xx_system_get_version(this, &version);
+    lr20xx_status_t status = lr20xx_system_get_version(&this->m_radio[idx], &version);
     if (status == LR20XX_STATUS_OK) {
         Fw::LogStringArg msg;
-        msg.format("Chip Version %X.%X", version.major, version.minor);
+        msg.format("radio %d chip version %X.%X", static_cast<int>(idx), version.major, version.minor);
         this->log_DIAGNOSTIC_LR2021(msg);
     }
 }
@@ -143,31 +153,95 @@ void LR2021Manager ::logHex(const char* tag, const U8* data, U16 len) {
 }
 
 // ----------------------------------------------------------------------
-// Mode selection
+// Radio bring-up / selection
 // ----------------------------------------------------------------------
 
-bool LR2021Manager ::setMode(RadioMode mode, U32 freq_hz, I8 power_dbm) {
-    // A mode switch aborts any in-flight TX: return its buffer to the ComStub.
-    if (this->m_txInFlight && this->isConnected_asyncSendReturnIn_OutputPort(0)) {
-        Fw::Buffer buffer = m_workingBuffer;
-        m_workingBuffer = Fw::Buffer();
-        this->asyncSendReturnIn_out(0, buffer, Drv::ByteStreamStatus::SEND_RETRY);
+void LR2021Manager ::setModuleType(FwIndexType idx, ModuleType type) {
+    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
+    this->m_radio[idx].moduleType = type;
+}
+
+void LR2021Manager ::setCcsdsRole(FwIndexType idx, CcsdsRole role) {
+    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
+    this->m_radio[idx].ccsdsRole = role;
+}
+
+void LR2021Manager ::setTxFreq(FwIndexType idx, U32 tx_freq_hz) {
+    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
+    this->m_radio[idx].txFreqHz = tx_freq_hz;
+}
+
+void LR2021Manager ::setRxFreq(FwIndexType idx, U32 rx_freq_hz) {
+    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
+    this->m_radio[idx].rxFreqHz = rx_freq_hz;
+}
+
+void LR2021Manager ::setTxRoute(FwIndexType comQueueIndex, FwIndexType radioIdx) {
+    FW_ASSERT((comQueueIndex >= 0) && (comQueueIndex < TX_ROUTE_TABLE_SIZE),
+              static_cast<FwAssertArgType>(comQueueIndex));
+    FW_ASSERT((radioIdx >= 0) && (radioIdx < NUM_RADIOS), static_cast<FwAssertArgType>(radioIdx));
+    this->m_txRoute[comQueueIndex] = radioIdx;
+}
+
+FwIndexType LR2021Manager ::routeTx(const ComCfg::FrameContext& context) const {
+    const FwIndexType queueIndex = context.get_comQueueIndex();
+    if ((queueIndex >= 0) && (queueIndex < TX_ROUTE_TABLE_SIZE)) {
+        return this->m_txRoute[queueIndex];
     }
+    return 0;
+}
+
+void LR2021Manager ::txComplete(RadioSlot& r, Fw::Success status) {
+    if (r.workingBuffer.isValid()) {
+        Fw::Buffer buffer = r.workingBuffer;
+        ComCfg::FrameContext context = r.workingContext;
+        r.workingBuffer = Fw::Buffer();
+        r.workingContext = ComCfg::FrameContext();
+        if (this->isConnected_dataReturnOut_OutputPort(0)) {
+            this->dataReturnOut_out(0, buffer, context);
+        }
+        if (this->isConnected_comStatusOut_OutputPort(0)) {
+            this->comStatusOut_out(0, status);
+        }
+        // A failed frame closes the com flow: the framer stack stops after a
+        // FAILURE status, so the next successful setMode() must re-open it.
+        this->m_comOpen = (status == Fw::Success::SUCCESS);
+    }
+}
+
+bool LR2021Manager ::setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 power_dbm) {
+    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
+    RadioSlot& r = this->m_radio[idx];
+
+    // A mode switch aborts any in-flight TX: drop the frame, returning its
+    // buffer (if it owns one) to the framer.
+    if (r.txInFlight && r.workingBuffer.isValid()) {
+        this->txComplete(r, Fw::Success::FAILURE);
+    }
+    r.txInFlight = false;
 
     bool ok = false;
     switch (mode) {
         case RadioMode::FLRC:
-            ok = this->flrcInit(freq_hz, power_dbm) && this->flrcRx(0);
+            ok = this->flrcInit(r, freq_hz, power_dbm) && this->flrcRx(r, 0);
             break;
         case RadioMode::FSK:
-            ok = this->fskInit(freq_hz, power_dbm) && this->fskRx(0);
+            ok = this->fskInit(r, freq_hz, power_dbm) && this->fskRx(r, 0);
             break;
         default:
             break;
     }
     if (ok) {
-        this->m_freqHz = freq_hz;
-        this->m_powerDbm = power_dbm;
+        r.freqHz = freq_hz;
+        r.powerDbm = power_dbm;
+        // Open (or re-open after a failure) the downlink flow. Emitted only
+        // once: the framer stack must see a single initial comStatus, each
+        // further one is granted per completed TX in txComplete().
+        if (!this->m_comOpen && this->isConnected_comStatusOut_OutputPort(0)) {
+            Fw::Success success = Fw::Success::SUCCESS;
+            this->comStatusOut_out(0, success);
+            this->m_comOpen = true;
+        }
     }
     return ok;
 }
@@ -177,74 +251,104 @@ bool LR2021Manager ::setMode(RadioMode mode, U32 freq_hz, I8 power_dbm) {
 // ----------------------------------------------------------------------
 
 void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
-    // Poll radio IRQs (TX done / RX done / errors) for the active mode.
-    switch (this->m_mode) {
-        case RadioMode::FLRC:
-            this->flrcService();
-            break;
-        case RadioMode::FSK:
-            this->fskService();
-            break;
-        default:
-            break;
+    // Poll radio IRQs (TX done / RX done / errors) on every radio.
+    for (FwIndexType i = 0; i < NUM_RADIOS; i++) {
+        RadioSlot& r = this->m_radio[i];
+        switch (r.mode) {
+            case RadioMode::FLRC:
+                this->flrcService(r);
+                break;
+            case RadioMode::FSK:
+                this->fskService(r);
+                break;
+            default:
+                break;
+        }
     }
 }
 
-void LR2021Manager ::asyncSendIn_handler(FwIndexType portNum,
-                                         Fw::Buffer& sendBuffer) {
-    // DEBUG("portNum=%d, sendBuffer.size=%llu", portNum, sendBuffer.getSize());
-    Drv::ByteStreamStatus status = Drv::ByteStreamStatus::SEND_RETRY;
-    if (this->m_txInFlight) {
-        if (this->isConnected_asyncSendReturnIn_OutputPort(0)) {
-            this->asyncSendReturnIn_out(0, sendBuffer, Drv::ByteStreamStatus::SEND_RETRY);
-        }
-        return;
-    }
-    if(!sendBuffer.isValid() || sendBuffer.getSize() == 0) {
-        DEBUG("!sendBuffer.isValid()");
-        if (this->isConnected_asyncSendReturnIn_OutputPort(0)) {
-            this->asyncSendReturnIn_out(0, sendBuffer, Drv::ByteStreamStatus::RECV_NO_DATA);
-        }
-        return;
-    }
+void LR2021Manager ::dataIn_handler(FwIndexType portNum,
+                                    Fw::Buffer& data,
+                                    const ComCfg::FrameContext& context) {
+    // Downlink routing: the frame context's comQueueIndex selects the radio
+    // through the route table (telemetry / events -> UHF, file -> S-band).
+    const FwIndexType idx = this->routeTx(context);
+    RadioSlot& r = this->m_radio[idx];
 
-    m_workingBuffer = sendBuffer;
-    switch (this->m_mode) {
-        case RadioMode::FLRC:
-            this->flrcTx(m_workingBuffer.getData(), m_workingBuffer.getSize());
-            break;
-        case RadioMode::FSK:
-            this->fskTx(m_workingBuffer.getData(), m_workingBuffer.getSize());
-            break;
-        default:
-            break;
+    // The framer stack sends one frame per comStatus credit, so the routed
+    // radio is normally idle here; any local failure drops the frame.
+    bool ok = false;
+    if (data.isValid() && (data.getSize() > 0) && !r.txInFlight) {
+        r.workingBuffer = data;
+        r.workingContext = context;
+        switch (r.mode) {
+            case RadioMode::FLRC:
+                ok = this->flrcTx(r, r.workingBuffer.getData(), r.workingBuffer.getSize());
+                break;
+            case RadioMode::FSK:
+                ok = this->fskTx(r, r.workingBuffer.getData(), r.workingBuffer.getSize());
+                break;
+            default:
+                break;
+        }
+        if (!ok) {
+            r.workingBuffer = Fw::Buffer();
+            r.workingContext = ComCfg::FrameContext();
+        }
+    }
+    if (!ok) {
+        DEBUG("radio %d TX frame dropped", static_cast<int>(idx));
+        this->log_WARNING_HI_TxFrameDropped(static_cast<U8>(idx));
+        if (this->isConnected_dataReturnOut_OutputPort(0)) {
+            this->dataReturnOut_out(0, data, context);
+        }
+        if (this->isConnected_comStatusOut_OutputPort(0)) {
+            Fw::Success failure = Fw::Success::FAILURE;
+            this->comStatusOut_out(0, failure);
+        }
+        // Closed until a successful setMode() re-opens the flow.
+        this->m_comOpen = false;
     }
 }
 
-void LR2021Manager ::recvReturnIn_handler(FwIndexType portNum, Fw::Buffer& fwBuffer) {
-    this->deallocate_out(0, fwBuffer);
+void LR2021Manager ::dataReturnIn_handler(FwIndexType portNum,
+                                          Fw::Buffer& data,
+                                          const ComCfg::FrameContext& context) {
+    this->deallocate_out(0, data);
 }
 
 // ----------------------------------------------------------------------
 // Handler implementations for commands
 // ----------------------------------------------------------------------
 
-void LR2021Manager ::RESET_cmdHandler(FwOpcodeType opCode, U32 cmdSeq) {
+void LR2021Manager ::RESET_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U8 radio) {
+    if (radio >= NUM_RADIOS) {
+        this->log_WARNING_LO_BadRadioIndex(radio);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
     // radioInit() resets the chip and re-applies the chip-level config
     // (regulator, clocks, DIO routing / RF switches).
-    bool ok = this->radioInit();
-    if (ok && (this->m_mode != RadioMode::NONE)) {
+    RadioSlot& r = this->m_radio[radio];
+    bool ok = this->radioInit(radio);
+    if (ok && (r.mode != RadioMode::NONE)) {
         // Restore the previously active mode so the link comes back up.
-        ok = this->setMode(this->m_mode, this->m_freqHz, this->m_powerDbm);
+        ok = this->setMode(radio, r.mode, r.freqHz, r.powerDbm);
     }
     this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
 }
 
 void LR2021Manager ::SET_MODE_cmdHandler(FwOpcodeType opCode,
                                          U32 cmdSeq,
+                                         U8 radio,
                                          LR2021Manager_Mode mode,
                                          U32 freq_hz,
                                          I8 power_dbm) {
+    if (radio >= NUM_RADIOS) {
+        this->log_WARNING_LO_BadRadioIndex(radio);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
     RadioMode target = RadioMode::NONE;
     switch (mode.e) {
         case LR2021Manager_Mode::FLRC:
@@ -257,9 +361,9 @@ void LR2021Manager ::SET_MODE_cmdHandler(FwOpcodeType opCode,
             break;
     }
 
-    const bool ok = this->setMode(target, freq_hz, power_dbm);
+    const bool ok = this->setMode(radio, target, freq_hz, power_dbm);
     if (ok) {
-        this->log_ACTIVITY_HI_ModeSet(mode);
+        this->log_ACTIVITY_HI_ModeSet(radio, mode);
     }
     this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
 }
