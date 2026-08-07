@@ -48,6 +48,13 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Number of radio modules managed by this component.
     static constexpr FwIndexType NUM_RADIOS = 2;
 
+    //! Route-table target meaning "send out the byte-stream driver (UART)"
+    //! instead of a radio. One past the last radio index.
+    static constexpr FwIndexType UART_RADIO = NUM_RADIOS;
+
+    //! Number of synchronous send retries on the byte-stream driver.
+    static constexpr FwIndexType UART_RETRY_LIMIT = 3;
+
     // ----------------------------------------------------------------------
     // Radio-level types
     // ----------------------------------------------------------------------
@@ -265,6 +272,20 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     void run_handler(FwIndexType portNum,  //!< The port number
                      U32 context           //!< The call order
                      ) override;
+
+    //! Handler implementation for drvConnected (byte-stream driver ready).
+    //! No-op: the initial comStatus credit is emitted by setMode(); crediting
+    //! again here would let the framer send two frames before the first
+    //! completes.
+    void drvConnected_handler(FwIndexType portNum) override;
+
+    //! Handler implementation for drvReceiveIn: forward uplink bytes from the
+    //! byte-stream driver to dataOut (like a radio RX), or free the buffer on
+    //! a receive error.
+    void drvReceiveIn_handler(FwIndexType portNum,                     //!< The port number
+                              Fw::Buffer& recvBuffer,                  //!< The received buffer
+                              const Drv::ByteStreamStatus& recvStatus  //!< Receive status
+                              ) override;
 
     // ----------------------------------------------------------------------
     // Handler implementations for commands

@@ -179,7 +179,9 @@ void LR2021Manager ::setRxFreq(FwIndexType idx, U32 rx_freq_hz) {
 void LR2021Manager ::setTxRoute(FwIndexType comQueueIndex, FwIndexType radioIdx) {
     FW_ASSERT((comQueueIndex >= 0) && (comQueueIndex < TX_ROUTE_TABLE_SIZE),
               static_cast<FwAssertArgType>(comQueueIndex));
-    FW_ASSERT((radioIdx >= 0) && (radioIdx < NUM_RADIOS), static_cast<FwAssertArgType>(radioIdx));
+    // radioIdx in [0, NUM_RADIOS) selects a radio; UART_RADIO (== NUM_RADIOS)
+    // selects the byte-stream (UART) target.
+    FW_ASSERT((radioIdx >= 0) && (radioIdx <= UART_RADIO), static_cast<FwAssertArgType>(radioIdx));
     this->m_txRoute[comQueueIndex] = radioIdx;
 }
 
@@ -270,9 +272,33 @@ void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
 void LR2021Manager ::dataIn_handler(FwIndexType portNum,
                                     Fw::Buffer& data,
                                     const ComCfg::FrameContext& context) {
-    // Downlink routing: the frame context's comQueueIndex selects the radio
-    // through the route table (telemetry / events -> UHF, file -> S-band).
+    // Downlink routing: the frame context's comQueueIndex selects the target
+    // through the route table (telemetry / events -> UHF, file -> S-band, or
+    // the byte-stream UART target).
     const FwIndexType idx = this->routeTx(context);
+
+    // UART target: synchronous send straight to the byte-stream driver, then
+    // return the buffer and grant the next comStatus credit (like ComStub's
+    // synchronous path). No radio slot / working buffer involved.
+    if (idx == UART_RADIO) {
+        Fw::Success comSuccess = Fw::Success::FAILURE;
+        if (data.isValid() && this->isConnected_drvSendOut_OutputPort(0)) {
+            Drv::ByteStreamStatus st = Drv::ByteStreamStatus::SEND_RETRY;
+            for (FwIndexType i = 0; (st == Drv::ByteStreamStatus::SEND_RETRY) && (i < UART_RETRY_LIMIT); i++) {
+                st = this->drvSendOut_out(0, data);
+            }
+            comSuccess = (st == Drv::ByteStreamStatus::OP_OK) ? Fw::Success::SUCCESS : Fw::Success::FAILURE;
+        }
+        if (this->isConnected_dataReturnOut_OutputPort(0)) {
+            this->dataReturnOut_out(0, data, context);
+        }
+        if (this->isConnected_comStatusOut_OutputPort(0)) {
+            this->comStatusOut_out(0, comSuccess);
+        }
+        this->m_comOpen = (comSuccess == Fw::Success::SUCCESS);
+        return;
+    }
+
     RadioSlot& r = this->m_radio[idx];
 
     // The framer stack sends one frame per comStatus credit, so the routed
@@ -314,7 +340,29 @@ void LR2021Manager ::dataIn_handler(FwIndexType portNum,
 void LR2021Manager ::dataReturnIn_handler(FwIndexType portNum,
                                           Fw::Buffer& data,
                                           const ComCfg::FrameContext& context) {
+    // Frees both radio-RX buffers and UART-RX buffers: all come from the same
+    // buffer manager (our allocate port and the byte-stream driver's allocate
+    // port point at it), so a plain deallocate returns them correctly.
     this->deallocate_out(0, data);
+}
+
+void LR2021Manager ::drvConnected_handler(FwIndexType portNum) {
+    // Intentionally empty: the single initial comStatus credit is emitted by
+    // setMode(). See the declaration comment.
+}
+
+void LR2021Manager ::drvReceiveIn_handler(FwIndexType portNum,
+                                          Fw::Buffer& recvBuffer,
+                                          const Drv::ByteStreamStatus& recvStatus) {
+    if (recvStatus != Drv::ByteStreamStatus::OP_OK) {
+        // Receive failed: free the driver's buffer, nothing to forward.
+        this->deallocate_out(0, recvBuffer);
+        return;
+    }
+    // Forward uplink bytes to the frame accumulator with an empty context
+    // (the byte-stream carries raw framed bytes, like a radio RX).
+    ComCfg::FrameContext emptyContext;
+    this->dataOut_out(0, recvBuffer, emptyContext);
 }
 
 // ----------------------------------------------------------------------

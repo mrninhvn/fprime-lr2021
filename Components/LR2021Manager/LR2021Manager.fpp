@@ -55,6 +55,26 @@ module LR2021 {
         output port deallocate: Fw.BufferSend
 
         # ----------------------------------------------------------------------
+        # Byte-stream client (optional wired UART downlink target)
+        # ----------------------------------------------------------------------
+        # A third downlink target besides the two radios: frames routed to
+        # UART_RADIO are sent straight to a Drv.ByteStreamDriver (comDriver over
+        # USB CDC). Mirrors what ComStub does internally, so no ComStub instance
+        # is needed. Uplink bytes from the driver are forwarded to dataOut like
+        # a radio RX. The driver allocates/deallocates from the same buffer
+        # manager as our allocate/deallocate ports, so returned RX buffers are
+        # freed directly in dataReturnIn (no separate recv-return port needed).
+
+        @ Send a downlink frame out the byte-stream driver (synchronous)
+        output port drvSendOut: Drv.ByteStreamSend
+
+        @ Ready signal from the byte-stream driver
+        sync input port drvConnected: Drv.ByteStreamReady
+
+        @ Uplink data received from the byte-stream driver, forwarded to dataOut
+        sync input port drvReceiveIn: Drv.ByteStreamData
+
+        # ----------------------------------------------------------------------
         # Commands
         # ----------------------------------------------------------------------
 
