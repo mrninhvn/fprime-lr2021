@@ -69,7 +69,7 @@ void init() {
     for (U16 y = 0; y < 256; y++) {
         U8 z = 0;
         for (U8 i = 0; i < 8; i++) {
-            if (gtrace(gmul(gf_exp[i], static_cast<U8>(y))) != 0) {
+            if (gtrace(gmul(gf_exp[(117 * i) % 255], static_cast<U8>(y))) != 0) {
                 z |= static_cast<U8>(0x80 >> i);
             }
         }
