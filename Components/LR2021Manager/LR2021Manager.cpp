@@ -10,6 +10,7 @@
 #include <cstdio>
 
 extern "C" {
+#include "lr20xx_radio_common.h"
 #include "lr20xx_system.h"
 }
 
@@ -246,6 +247,42 @@ bool LR2021Manager ::setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 po
         }
     }
     return ok;
+}
+
+bool LR2021Manager ::txCw(FwIndexType idx, U32 freq_hz, I8 power_dbm) {
+    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
+    RadioSlot& r = this->m_radio[idx];
+
+    // Bench test: key an unmodulated carrier at freq_hz / power_dbm. The band
+    // RX/PA path was selected once in setMode (radioInit + fskInit/flrcInit),
+    // so keep freq_hz in that radio's band. Enters STANDBY_XOSC (TCXO running),
+    // (re)programs power and frequency, then the continuous-wave test mode.
+    lr20xx_status_t status = lr20xx_system_set_standby_mode(&r, LR20XX_SYSTEM_STANDBY_MODE_XOSC);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("CW set_standby failed (%d)", status);
+        return false;
+    }
+    // set_tx_params takes 0.5 dBm steps.
+    status = lr20xx_radio_common_set_tx_params(&r, static_cast<int8_t>(power_dbm * 2),
+                                               LR20XX_RADIO_COMMON_RAMP_96_US);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("CW set_tx_params failed (%d)", status);
+        return false;
+    }
+    status = lr20xx_radio_common_set_rf_freq(&r, freq_hz);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("CW set_rf_freq failed (%d)", status);
+        return false;
+    }
+    r.progFreqHz = freq_hz;
+    status = lr20xx_radio_common_set_tx_test_mode(&r, LR20XX_RADIO_COMMON_TX_TEST_MODE_CONTINUOUS_WAVE);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("CW set_tx_test_mode failed (%d)", status);
+        return false;
+    }
+    r.txInFlight = true;  // carrier is up; services stay IRQ-driven no-ops
+    DEBUG("radio %d CW on: %u Hz, %d dBm", static_cast<int>(idx), freq_hz, static_cast<int>(power_dbm));
+    return true;
 }
 
 // ----------------------------------------------------------------------

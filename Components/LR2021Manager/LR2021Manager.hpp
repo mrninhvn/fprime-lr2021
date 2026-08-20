@@ -181,6 +181,13 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! \return true on success
     bool setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 power_dbm);
 
+    //! Bench test: key an unmodulated continuous-wave carrier on radio \p idx
+    //! at \p freq_hz / \p power_dbm (keep freq_hz in the band selected by the
+    //! preceding setMode). Stays on until the next setMode()/RESET. Meant to
+    //! be called at boot for spectrum-analyser measurements.
+    //! \return true on success
+    bool txCw(FwIndexType idx, U32 freq_hz, I8 power_dbm);
+
     // ----------------------------------------------------------------------
     // FLRC radio operations (implemented in LR2021Flrc.cpp)
     // ----------------------------------------------------------------------
