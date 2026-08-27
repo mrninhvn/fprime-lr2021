@@ -62,6 +62,13 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Active modulation / packet engine of one radio.
     enum class RadioMode { NONE, FLRC, FSK };
 
+    //! Destination for received (uplink) packets.
+    //!   DATA_OUT: the Svc.Com dataOut port (frame accumulator / deframer);
+    //!             the flight default.
+    //!   UART:     straight out drvSendOut to the byte-stream (UART) driver,
+    //!             raw, for a ground relay that pipes radio RX to a host GDS.
+    enum class RxSink { DATA_OUT, UART };
+
     //! Radio module populated on an SPI slot. The modules differ in
     //! clocking (NiceRF: chip-supplied TCXO; RY42F: crystal) and in their
     //! DIO map (IRQ pad and RF-switch tree), so radioInit() branches on it.
@@ -170,6 +177,12 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! \p radioIdx. Unconfigured queue indices go to radio 0. Called from
     //! the topology (e.g. route the FILE buffer queue to the S-band radio).
     void setTxRoute(FwIndexType comQueueIndex, FwIndexType radioIdx);
+
+    //! Select where received packets are forwarded: the Svc.Com dataOut port
+    //! (RxSink::DATA_OUT, default / flight) or straight out the byte-stream
+    //! (UART) driver via drvSendOut (RxSink::UART, ground relay). Call from the
+    //! topology before RX starts.
+    void setRxSink(RxSink sink);
 
     //! Initialize the chip of radio \p idx (clocks, DIO/RF-switch map for
     //! its module type, regulator).
@@ -335,12 +348,19 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! FAILURE closes the com flow until the next successful setMode().
     void txComplete(RadioSlot& r, Fw::Success status);
 
+    //! Forward a received packet of \p len bytes to the configured RX sink
+    //! (dataOut in flight, or the byte-stream/UART driver on a ground relay).
+    //! Allocates a buffer from the buffer manager and always returns it. Does
+    //! nothing when \p data is nullptr or \p len is 0.
+    void forwardRxPacket(const U8* data, U16 len);
+
     // ----------------------------------------------------------------------
     // State
     // ----------------------------------------------------------------------
 
     RadioSlot m_radio[NUM_RADIOS];  //!< Per-radio state (driver contexts)
     FwIndexType m_txRoute[TX_ROUTE_TABLE_SIZE] = {0};  //!< comQueueIndex -> radio
+    RxSink m_rxSink = RxSink::DATA_OUT;                 //!< Destination for received packets
     bool m_comOpen = false;         //!< Initial comStatus READY emitted / flow open
     U32 m_txCount = 0;              //!< FLRC packets transmitted (all radios)
     U32 m_rxCount = 0;              //!< FLRC packets received (all radios)

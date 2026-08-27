@@ -577,15 +577,9 @@ void LR2021Manager ::fskService(RadioSlot& r) {
         }
         if (out_len > 0) {
             this->logHex("FSK RX", out_data, (out_len > 32) ? 32 : out_len);
-            Fw::Buffer recv_buffer = this->allocate_out(0, out_len);
-            if (recv_buffer.getData()) {
-                memcpy(recv_buffer.getData(), out_data, out_len);
-                recv_buffer.setSize(out_len);
-                // Uplink bytes carry no frame context yet: the accumulator
-                // extracts frames from the stream and ignores it.
-                ComCfg::FrameContext emptyContext;
-                this->dataOut_out(0, recv_buffer, emptyContext);
-            }
+            // Forward to the configured RX sink: dataOut (frame accumulator) in
+            // flight, or straight out the UART driver on a ground relay.
+            this->forwardRxPacket(out_data, out_len);
         }
 
         this->m_fskRxCount++;

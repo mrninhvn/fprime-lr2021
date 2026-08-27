@@ -8,6 +8,7 @@
 
 #include <Fw/Types/Assert.hpp>
 #include <cstdio>
+#include <cstring>
 
 extern "C" {
 #include "lr20xx_radio_common.h"
@@ -184,6 +185,47 @@ void LR2021Manager ::setTxRoute(FwIndexType comQueueIndex, FwIndexType radioIdx)
     // selects the byte-stream (UART) target.
     FW_ASSERT((radioIdx >= 0) && (radioIdx <= UART_RADIO), static_cast<FwAssertArgType>(radioIdx));
     this->m_txRoute[comQueueIndex] = radioIdx;
+}
+
+void LR2021Manager ::setRxSink(RxSink sink) {
+    this->m_rxSink = sink;
+}
+
+void LR2021Manager ::forwardRxPacket(const U8* data, U16 len) {
+    if ((data == nullptr) || (len == 0)) {
+        return;
+    }
+    Fw::Buffer recv_buffer = this->allocate_out(0, len);
+    if (recv_buffer.getData() == nullptr) {
+        // Allocator gave back an empty buffer: return it and drop the packet.
+        this->deallocate_out(0, recv_buffer);
+        return;
+    }
+    std::memcpy(recv_buffer.getData(), data, len);
+    recv_buffer.setSize(len);
+
+    if (this->m_rxSink == RxSink::UART) {
+        // Ground relay: push the raw packet bytes straight out the byte-stream
+        // (UART) driver. The send copies synchronously, so we keep ownership of
+        // the buffer the whole time and free it right after.
+        if (this->isConnected_drvSendOut_OutputPort(0)) {
+            Drv::ByteStreamStatus st = Drv::ByteStreamStatus::SEND_RETRY;
+            for (FwIndexType i = 0; (st == Drv::ByteStreamStatus::SEND_RETRY) && (i < UART_RETRY_LIMIT); i++) {
+                st = this->drvSendOut_out(0, recv_buffer);
+            }
+        }
+        this->deallocate_out(0, recv_buffer);
+    } else {
+        // Flight: hand the packet to the Svc.Com dataOut port (frame
+        // accumulator). Ownership passes downstream and comes back on
+        // dataReturnIn. If unconnected, free it here so it is not leaked.
+        if (this->isConnected_dataOut_OutputPort(0)) {
+            ComCfg::FrameContext emptyContext;
+            this->dataOut_out(0, recv_buffer, emptyContext);
+        } else {
+            this->deallocate_out(0, recv_buffer);
+        }
+    }
 }
 
 FwIndexType LR2021Manager ::routeTx(const ComCfg::FrameContext& context) const {

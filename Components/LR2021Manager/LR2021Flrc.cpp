@@ -271,15 +271,9 @@ void LR2021Manager ::flrcService(RadioSlot& r) {
         U8 payload[FLRC_MAX_PAYLOAD] = {0};
         if ((pkt_len > 0) && (lr20xx_radio_fifo_read_rx(&r, payload, pkt_len) == LR20XX_STATUS_OK)) {
             this->logHex("FLRC RX", payload, (pkt_len > 32) ? 32 : pkt_len);
-            Fw::Buffer recv_buffer = this->allocate_out(0, pkt_len);
-            if (recv_buffer.getData()) {
-                memcpy(recv_buffer.getData(), payload, pkt_len);
-                recv_buffer.setSize(pkt_len);
-                // Uplink bytes carry no frame context yet: the accumulator
-                // extracts frames from the stream and ignores it.
-                ComCfg::FrameContext emptyContext;
-                this->dataOut_out(0, recv_buffer, emptyContext);
-            }
+            // Forward to the configured RX sink: dataOut (frame accumulator) in
+            // flight, or straight out the UART driver on a ground relay.
+            this->forwardRxPacket(payload, pkt_len);
         }
 
         this->m_rxCount++;
