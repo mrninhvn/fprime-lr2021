@@ -438,10 +438,48 @@ void LR2021Manager ::drvReceiveIn_handler(FwIndexType portNum,
         this->deallocate_out(0, recvBuffer);
         return;
     }
-    // Forward uplink bytes to the frame accumulator with an empty context
-    // (the byte-stream carries raw framed bytes, like a radio RX).
+    if (this->m_rxSink == RxSink::UART) {
+        // Ground uplink relay: transmit the host's bytes over the radio, then
+        // free the driver buffer (the radio TX copies into its FIFO).
+        this->relayUplink(recvBuffer);
+        this->deallocate_out(0, recvBuffer);
+        return;
+    }
+    // Flight: forward uplink bytes to the frame accumulator with an empty
+    // context (the byte-stream carries raw framed bytes, like a radio RX).
     ComCfg::FrameContext emptyContext;
     this->dataOut_out(0, recvBuffer, emptyContext);
+}
+
+void LR2021Manager ::relayUplink(Fw::Buffer& data) {
+    // Full route: all ground uplink goes to radio 0 for now.
+    // TODO: parse the CCSDS primary-header APID and route to the radio
+    // configured for that APID (per-APID route table), so multiple uplink
+    // targets can share the host UART.
+    const FwIndexType idx = 0;
+    RadioSlot& r = this->m_radio[idx];
+
+    // No working buffer / comStatus crediting for a relay: flrcTx/fskTx copy
+    // the payload into the radio FIFO synchronously, so the source buffer is
+    // freed by the caller right after. TX_DONE in the service loop then finds
+    // an empty working buffer and returns the radio to RX.
+    bool ok = false;
+    if (data.isValid() && (data.getSize() > 0) && !r.txInFlight) {
+        switch (r.mode) {
+            case RadioMode::FLRC:
+                ok = this->flrcTx(r, data.getData(), static_cast<U16>(data.getSize()));
+                break;
+            case RadioMode::FSK:
+                ok = this->fskTx(r, data.getData(), static_cast<U16>(data.getSize()));
+                break;
+            default:
+                break;
+        }
+    }
+    if (!ok) {
+        DEBUG("radio %d uplink relay dropped", static_cast<int>(idx));
+        this->log_WARNING_HI_TxFrameDropped(static_cast<U8>(idx));
+    }
 }
 
 // ----------------------------------------------------------------------

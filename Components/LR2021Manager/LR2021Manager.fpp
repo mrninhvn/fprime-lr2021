@@ -71,8 +71,11 @@ module LR2021 {
         @ Ready signal from the byte-stream driver
         sync input port drvConnected: Drv.ByteStreamReady
 
-        @ Uplink data received from the byte-stream driver, forwarded to dataOut
-        sync input port drvReceiveIn: Drv.ByteStreamData
+        @ Uplink data received from the byte-stream driver. In flight it is
+        @ forwarded to dataOut (like a radio RX); on a ground relay (RxSink
+        @ UART) it is transmitted over the radio instead. Async so that radio
+        @ TX runs on this component's thread, serialized with run().
+        async input port drvReceiveIn: Drv.ByteStreamData
 
         # ----------------------------------------------------------------------
         # Commands

@@ -299,9 +299,10 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! completes.
     void drvConnected_handler(FwIndexType portNum) override;
 
-    //! Handler implementation for drvReceiveIn: forward uplink bytes from the
-    //! byte-stream driver to dataOut (like a radio RX), or free the buffer on
-    //! a receive error.
+    //! Handler implementation for drvReceiveIn: in flight, forward uplink bytes
+    //! from the byte-stream driver to dataOut (like a radio RX); on a ground
+    //! relay (RxSink::UART) transmit them over the radio instead. Frees the
+    //! buffer on a receive error. Async: runs on this component's thread.
     void drvReceiveIn_handler(FwIndexType portNum,                     //!< The port number
                               Fw::Buffer& recvBuffer,                  //!< The received buffer
                               const Drv::ByteStreamStatus& recvStatus  //!< Receive status
@@ -353,6 +354,12 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Allocates a buffer from the buffer manager and always returns it. Does
     //! nothing when \p data is nullptr or \p len is 0.
     void forwardRxPacket(const U8* data, U16 len);
+
+    //! Ground uplink relay: transmit the bytes in \p data over the radio.
+    //! Full route to radio 0 for now (TODO: route by CCSDS APID). The radio
+    //! TX copies the payload into its FIFO synchronously, so the caller keeps
+    //! ownership of \p data and frees it after this returns.
+    void relayUplink(Fw::Buffer& data);
 
     // ----------------------------------------------------------------------
     // State
