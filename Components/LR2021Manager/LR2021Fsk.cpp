@@ -529,7 +529,12 @@ void LR2021Manager ::fskService(RadioSlot& r) {
         this->m_fskTxCount++;
         this->tlmWrite_FskTxCount(this->m_fskTxCount);
         // this->log_ACTIVITY_HI_FskTxDone(static_cast<U8>(r.idx));
-        DEBUG("radio %d TX done, %llu bytes", static_cast<int>(r.idx), r.workingBuffer.getSize());
+        // Only the framer/downlink path fills the working buffer; a relay TX
+        // (relayIn) leaves it empty and logs its own size in relayUplink, so
+        // don't print a misleading "0 bytes" here for that case.
+        if (r.workingBuffer.isValid()) {
+            DEBUG("radio %d TX done, %llu bytes", static_cast<int>(r.idx), r.workingBuffer.getSize());
+        }
         // Only a TX that owns an F Prime buffer returns one (and grants the
         // next comStatus credit).
         this->txComplete(r, Fw::Success::SUCCESS);

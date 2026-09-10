@@ -299,14 +299,21 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! completes.
     void drvConnected_handler(FwIndexType portNum) override;
 
-    //! Handler implementation for drvReceiveIn: in flight, forward uplink bytes
-    //! from the byte-stream driver to dataOut (like a radio RX); on a ground
-    //! relay (RxSink::UART) transmit them over the radio instead. Frees the
-    //! buffer on a receive error. Async: runs on this component's thread.
+    //! Handler implementation for drvReceiveIn: forward uplink bytes from the
+    //! byte-stream driver to dataOut (like a radio RX), feeding the deframe /
+    //! APID-router stack. Frees the buffer on a receive error. Async: runs on
+    //! this component's thread.
     void drvReceiveIn_handler(FwIndexType portNum,                     //!< The port number
                               Fw::Buffer& recvBuffer,                  //!< The received buffer
                               const Drv::ByteStreamStatus& recvStatus  //!< Receive status
                               ) override;
+
+    //! Handler implementation for relayIn: transmit a complete frame out the
+    //! radio verbatim (fire-and-forget), then free the buffer. Async: runs on
+    //! this component's thread, serialized with run().
+    void relayIn_handler(FwIndexType portNum,
+                         Fw::Buffer& data,
+                         const ComCfg::FrameContext& context) override;
 
     // ----------------------------------------------------------------------
     // Handler implementations for commands

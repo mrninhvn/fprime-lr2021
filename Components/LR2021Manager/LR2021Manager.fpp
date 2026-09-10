@@ -71,11 +71,20 @@ module LR2021 {
         @ Ready signal from the byte-stream driver
         sync input port drvConnected: Drv.ByteStreamReady
 
-        @ Uplink data received from the byte-stream driver. In flight it is
-        @ forwarded to dataOut (like a radio RX); on a ground relay (RxSink
-        @ UART) it is transmitted over the radio instead. Async so that radio
-        @ TX runs on this component's thread, serialized with run().
+        @ Uplink data received from the byte-stream driver, forwarded to dataOut
+        @ (like a radio RX) for the deframe / APID-router stack. Async so it runs
+        @ on this component's thread.
         async input port drvReceiveIn: Drv.ByteStreamData
+
+        # ----------------------------------------------------------------------
+        # Relay TX (uplink routing target)
+        # ----------------------------------------------------------------------
+
+        @ Complete frame to relay out the radio, verbatim (fire-and-forget).
+        @ Wired from the APID router's radioOut: frames whose APID routes to a
+        @ satellite are transmitted here and the buffer is freed after TX.
+        @ Async so radio TX runs on this component's thread, serialized with run().
+        async input port relayIn: Svc.ComDataWithContext
 
         # ----------------------------------------------------------------------
         # Commands

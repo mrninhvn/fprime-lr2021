@@ -438,17 +438,20 @@ void LR2021Manager ::drvReceiveIn_handler(FwIndexType portNum,
         this->deallocate_out(0, recvBuffer);
         return;
     }
-    if (this->m_rxSink == RxSink::UART) {
-        // Ground uplink relay: transmit the host's bytes over the radio, then
-        // free the driver buffer (the radio TX copies into its FIFO).
-        this->relayUplink(recvBuffer);
-        this->deallocate_out(0, recvBuffer);
-        return;
-    }
-    // Flight: forward uplink bytes to the frame accumulator with an empty
-    // context (the byte-stream carries raw framed bytes, like a radio RX).
+    // Forward uplink bytes to the frame accumulator with an empty context (the
+    // byte-stream carries raw framed bytes, like a radio RX). The accumulator
+    // and APID router downstream decide local-vs-radio routing.
     ComCfg::FrameContext emptyContext;
     this->dataOut_out(0, recvBuffer, emptyContext);
+}
+
+void LR2021Manager ::relayIn_handler(FwIndexType portNum, Fw::Buffer& data, const ComCfg::FrameContext& context) {
+    // A complete frame routed to the radio by the APID router: transmit it
+    // verbatim (fire-and-forget) and free the buffer. flrcTx/fskTx copy the
+    // payload into the radio FIFO synchronously, so the buffer can be returned
+    // to the (shared) buffer manager immediately.
+    this->relayUplink(data);
+    this->deallocate_out(0, data);
 }
 
 void LR2021Manager ::relayUplink(Fw::Buffer& data) {
@@ -463,21 +466,27 @@ void LR2021Manager ::relayUplink(Fw::Buffer& data) {
     // the payload into the radio FIFO synchronously, so the source buffer is
     // freed by the caller right after. TX_DONE in the service loop then finds
     // an empty working buffer and returns the radio to RX.
+    const U16 len = data.isValid() ? static_cast<U16>(data.getSize()) : 0;
     bool ok = false;
-    if (data.isValid() && (data.getSize() > 0) && !r.txInFlight) {
+    if ((len > 0) && !r.txInFlight) {
         switch (r.mode) {
             case RadioMode::FLRC:
-                ok = this->flrcTx(r, data.getData(), static_cast<U16>(data.getSize()));
+                ok = this->flrcTx(r, data.getData(), len);
                 break;
             case RadioMode::FSK:
-                ok = this->fskTx(r, data.getData(), static_cast<U16>(data.getSize()));
+                ok = this->fskTx(r, data.getData(), len);
                 break;
             default:
                 break;
         }
     }
-    if (!ok) {
-        DEBUG("radio %d uplink relay dropped", static_cast<int>(idx));
+    if (ok) {
+        // The relay path does not use the working buffer, so flrcService's
+        // "TX done" prints 0 bytes; log the actual relayed size here instead.
+        DEBUG("radio %d relay TX %u bytes", static_cast<int>(idx), static_cast<unsigned>(len));
+    } else {
+        DEBUG("radio %d uplink relay dropped (%u bytes, txInFlight=%d)", static_cast<int>(idx),
+              static_cast<unsigned>(len), static_cast<int>(r.txInFlight));
         this->log_WARNING_HI_TxFrameDropped(static_cast<U8>(idx));
     }
 }
