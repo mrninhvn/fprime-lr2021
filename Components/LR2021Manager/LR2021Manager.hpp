@@ -322,21 +322,66 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Handler implementation for command RESET
     //!
     //! Reset one radio and re-initialise it, restoring its active mode
-    void RESET_cmdHandler(FwOpcodeType opCode,  //!< The opcode
-                          U32 cmdSeq,           //!< The command sequence number
-                          U8 radio              //!< Radio index
-                          ) override;
+    void RadioReset_cmdHandler(FwOpcodeType opCode,  //!< The opcode
+                               U32 cmdSeq,           //!< The command sequence number
+                               U8 radio              //!< Radio index
+                              ) override;
 
     //! Handler implementation for command SET_MODE
     //!
     //! Switch the active modulation of one radio at runtime
-    void SET_MODE_cmdHandler(FwOpcodeType opCode,      //!< The opcode
-                             U32 cmdSeq,               //!< The command sequence number
-                             U8 radio,                 //!< Radio index
-                             LR2021Manager_Mode mode,  //!< Modulation to activate
-                             U32 freq_hz,              //!< RF centre frequency in Hz
-                             I8 power_dbm              //!< TX output power in dBm
-                             ) override;
+    void RadioSetMode_cmdHandler(FwOpcodeType opCode,      //!< The opcode
+                                 U32 cmdSeq,               //!< The command sequence number
+                                 U8 radio,                 //!< Radio index
+                                 LR2021Manager_Mode mode,  //!< Modulation to activate
+                                 U32 freq_hz,              //!< RF centre frequency in Hz
+                                 I8 power_dbm              //!< TX output power in dBm
+                                ) override;
+
+    //! Handler implementation for command RadioPower
+    //!
+    //! Turn a radio module's load switch on or off
+    void RadioPower_cmdHandler(FwOpcodeType opCode,  //!< The opcode
+                          U32 cmdSeq,           //!< The command sequence number
+                          U8 radio,             //!< Radio index
+                          Fw::On power          //!< ON = power the module, OFF = cut power
+                          ) override;
+
+    //! Handler implementation for command RadioSetModulation
+    //!
+    //! Change only the modulation of a radio, keeping its last freq/power
+    void RadioSetModulation_cmdHandler(FwOpcodeType opCode,      //!< The opcode
+                                   U32 cmdSeq,               //!< The command sequence number
+                                   U8 radio,                 //!< Radio index
+                                   LR2021Manager_Mode mode   //!< Modulation to activate
+                                   ) override;
+
+    //! Handler implementation for command RadioSetFreq
+    //!
+    //! Change only the RF centre frequency of a radio, keeping mode/power
+    void RadioSetFreq_cmdHandler(FwOpcodeType opCode,  //!< The opcode
+                                 U32 cmdSeq,           //!< The command sequence number
+                                 U8 radio,             //!< Radio index
+                                 U32 freq_hz           //!< RF centre frequency in Hz
+                                ) override;
+
+    //! Handler implementation for command RadioSetPower
+    //!
+    //! Change only the TX output power of a radio, keeping mode/frequency
+    void RadioSetPower_cmdHandler(FwOpcodeType opCode,  //!< The opcode
+                              U32 cmdSeq,           //!< The command sequence number
+                              U8 radio,             //!< Radio index
+                              I8 power_dbm          //!< TX output power in dBm
+                              ) override;
+
+    //! Handler implementation for command RadioTxRoute
+    //!
+    //! Retarget a downlink source (events / telemetry / file) at runtime
+    void RadioTxRoute_cmdHandler(FwOpcodeType opCode,             //!< The opcode
+                                 U32 cmdSeq,                      //!< The command sequence number
+                                 LR2021Manager_RouteQueue source,  //!< Downlink source to retarget
+                                 U8 target                        //!< Radio index (0/1) or UART_RADIO
+                                 ) override;
 
   private:
     // ----------------------------------------------------------------------

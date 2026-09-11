@@ -27,6 +27,21 @@ module LR2021 {
             FSK @< GMSK Frequency Shift Keying
         }
 
+        @ Downlink source queue routed by SET_TX_ROUTE. Values match the
+        @ comQueueIndex the topology assigns each ComQueue queue (EVENTS=0,
+        @ TELEMETRY=1, FILE=Svc.ComQueue.COM_PORT_COUNT+0=2): must be kept in
+        @ sync with the ComCcsds subtopology's queue layout.
+        enum RouteQueue {
+            EVT @< Event packets (ComQueue EVENTS queue)
+            TLM @< Telemetry packets (ComQueue TELEMETRY queue)
+            FILE @< File downlink buffers (ComQueue FILE buffer queue)
+        }
+
+        @ Downlink route target: a radio index (0 or 1) or UART_RADIO (2, the
+        @ byte-stream / USB CDC target). Kept as a plain U8 (not an enum) so
+        @ the same wire value works whether NUM_RADIOS ever changes.
+
+
         # ----------------------------------------------------------------------
         # Com adapter interface (Svc.Com), routed by frame context.
         # dataIn is async (the interface declares it sync) so the slow radio
@@ -91,17 +106,57 @@ module LR2021 {
         # ----------------------------------------------------------------------
 
         @ Reset one radio and re-initialise it, restoring its active mode
-        async command RESET(
+        async command RadioReset(
             radio: U8 @< Radio index (0 or 1)
         )
 
         @ Switch the active modulation of one radio at runtime
         @ (re-initialises the radio and enters continuous RX)
-        async command SET_MODE(
+        async command RadioSetMode(
             radio: U8 @< Radio index (0 or 1)
             mode: Mode @< Modulation to activate
             freq_hz: U32 @< RF centre frequency in Hz (e.g. 437000000)
             power_dbm: I8 @< TX output power in dBm
+        )
+
+        @ Turn a radio module's load switch on or off. OFF cuts power to the
+        @ chip (bench / fault-recovery use); bring it back with POWER ON
+        @ followed by RESET (which re-runs radioInit + restores the mode).
+        async command RadioPower(
+            radio: U8 @< Radio index (0 or 1)
+            power: Fw.On @< ON = power the module, OFF = cut power
+        )
+
+        @ Change only the modulation of a radio, keeping its last
+        @ frequency / power (from the last SET_MODE or SET_FREQ / SET_POWER).
+        @ Requires the radio to already have an active mode; use SET_MODE
+        @ for the first configuration after boot / RESET / POWER ON.
+        async command RadioSetModulation(
+            radio: U8 @< Radio index (0 or 1)
+            mode: Mode @< Modulation to activate
+        )
+
+        @ Change only the RF centre frequency of a radio, keeping its active
+        @ mode and TX power. Requires the radio to already have an active mode.
+        async command RadioSetFreq(
+            radio: U8 @< Radio index (0 or 1)
+            freq_hz: U32 @< RF centre frequency in Hz (e.g. 437000000)
+        )
+
+        @ Change only the TX output power of a radio, keeping its active mode
+        @ and frequency. Requires the radio to already have an active mode.
+        async command RadioSetPower(
+            radio: U8 @< Radio index (0 or 1)
+            power_dbm: I8 @< TX output power in dBm
+        )
+
+        @ Retarget a downlink source (events / telemetry / file) to a
+        @ different radio or the UART at runtime, without touching the other
+        @ two routes. Mirrors the topology's setTxRoute() call, callable from
+        @ the ground. Takes effect on the next frame of that queue.
+        async command RadioTxRoute(
+            source: RouteQueue @< Downlink source to retarget
+            target: U8 @< Radio index (0 or 1), or 2 for UART
         )
 
         # ----------------------------------------------------------------------
@@ -122,6 +177,23 @@ module LR2021 {
         @ Invalid radio index in a command
         event BadRadioIndex(radio: U8) severity warning low \
             format "Invalid radio index {}"
+
+        @ Radio module load switch turned on/off
+        event PowerSet(radio: U8, power: Fw.On) severity activity high \
+            format "Radio {} power set to {}"
+
+        @ SET_RADIO_MODE / SET_FREQ / SET_POWER issued before the radio had an
+        @ active mode (no prior SET_MODE / RESET with a stored mode)
+        event RadioNotConfigured(radio: U8) severity warning low \
+            format "Radio {} has no active mode; use SET_MODE first"
+
+        @ Downlink route target changed at runtime
+        event RouteSet(source: RouteQueue, target: U8) severity activity high \
+            format "Downlink route {} set to target {}"
+
+        @ SET_TX_ROUTE target out of range (not a valid radio index or UART)
+        event BadRouteTarget(target: U8) severity warning low \
+            format "Invalid route target {}"
 
         @ A downlink frame could not be transmitted and was dropped
         event TxFrameDropped(radio: U8) severity warning high \

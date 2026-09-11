@@ -495,7 +495,7 @@ void LR2021Manager ::relayUplink(Fw::Buffer& data) {
 // Handler implementations for commands
 // ----------------------------------------------------------------------
 
-void LR2021Manager ::RESET_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U8 radio) {
+void LR2021Manager ::RadioReset_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U8 radio) {
     if (radio >= NUM_RADIOS) {
         this->log_WARNING_LO_BadRadioIndex(radio);
         this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
@@ -512,12 +512,12 @@ void LR2021Manager ::RESET_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U8 radio)
     this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
 }
 
-void LR2021Manager ::SET_MODE_cmdHandler(FwOpcodeType opCode,
-                                         U32 cmdSeq,
-                                         U8 radio,
-                                         LR2021Manager_Mode mode,
-                                         U32 freq_hz,
-                                         I8 power_dbm) {
+void LR2021Manager ::RadioSetMode_cmdHandler(FwOpcodeType opCode,
+                                             U32 cmdSeq,
+                                             U8 radio,
+                                             LR2021Manager_Mode mode,
+                                             U32 freq_hz,
+                                             I8 power_dbm) {
     if (radio >= NUM_RADIOS) {
         this->log_WARNING_LO_BadRadioIndex(radio);
         this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
@@ -540,6 +540,100 @@ void LR2021Manager ::SET_MODE_cmdHandler(FwOpcodeType opCode,
         this->log_ACTIVITY_HI_ModeSet(radio, mode);
     }
     this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
+}
+
+void LR2021Manager ::RadioPower_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U8 radio, Fw::On power) {
+    if (radio >= NUM_RADIOS) {
+        this->log_WARNING_LO_BadRadioIndex(radio);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    if (!this->isConnected_powerGpioWrite_OutputPort(radio)) {
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::EXECUTION_ERROR);
+        return;
+    }
+    this->powerGpioWrite_out(radio, (power == Fw::On::ON) ? Fw::Logic::HIGH : Fw::Logic::LOW);
+    this->log_ACTIVITY_HI_PowerSet(radio, power);
+    this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
+}
+
+void LR2021Manager ::RadioSetModulation_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U8 radio, LR2021Manager_Mode mode) {
+    if (radio >= NUM_RADIOS) {
+        this->log_WARNING_LO_BadRadioIndex(radio);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    RadioSlot& r = this->m_radio[radio];
+    if (r.mode == RadioMode::NONE) {
+        this->log_WARNING_LO_RadioNotConfigured(radio);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    RadioMode target = RadioMode::NONE;
+    switch (mode.e) {
+        case LR2021Manager_Mode::FLRC:
+            target = RadioMode::FLRC;
+            break;
+        case LR2021Manager_Mode::FSK:
+            target = RadioMode::FSK;
+            break;
+        default:
+            break;
+    }
+    const bool ok = this->setMode(radio, target, r.freqHz, r.powerDbm);
+    if (ok) {
+        this->log_ACTIVITY_HI_ModeSet(radio, mode);
+    }
+    this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
+}
+
+void LR2021Manager ::RadioSetFreq_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U8 radio, U32 freq_hz) {
+    if (radio >= NUM_RADIOS) {
+        this->log_WARNING_LO_BadRadioIndex(radio);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    RadioSlot& r = this->m_radio[radio];
+    if (r.mode == RadioMode::NONE) {
+        this->log_WARNING_LO_RadioNotConfigured(radio);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    const bool ok = this->setMode(radio, r.mode, freq_hz, r.powerDbm);
+    this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
+}
+
+void LR2021Manager ::RadioSetPower_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U8 radio, I8 power_dbm) {
+    if (radio >= NUM_RADIOS) {
+        this->log_WARNING_LO_BadRadioIndex(radio);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    RadioSlot& r = this->m_radio[radio];
+    if (r.mode == RadioMode::NONE) {
+        this->log_WARNING_LO_RadioNotConfigured(radio);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    const bool ok = this->setMode(radio, r.mode, r.freqHz, power_dbm);
+    this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
+}
+
+void LR2021Manager ::RadioTxRoute_cmdHandler(FwOpcodeType opCode,
+                                             U32 cmdSeq,
+                                             LR2021Manager_RouteQueue source,
+                                             U8 target) {
+    if (target > UART_RADIO) {
+        this->log_WARNING_LO_BadRouteTarget(target);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    // RouteQueue values are defined to match the comQueueIndex the topology
+    // assigns each ComQueue queue (EVT=0, TLM=1, FILE=2); see the .fpp comment.
+    const FwIndexType queueIndex = static_cast<FwIndexType>(source.e);
+    this->setTxRoute(queueIndex, target);
+    this->log_ACTIVITY_HI_RouteSet(source, target);
+    this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
 }
 
 }  // namespace LR2021
