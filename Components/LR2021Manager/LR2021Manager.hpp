@@ -271,6 +271,23 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! component thread ~1 ms). Implemented in LR2021Adc.cpp.
     void rfPowerMeasureTx();
 
+    // ----------------------------------------------------------------------
+    // PolyDb (implemented in LR2021Manager.cpp)
+    // ----------------------------------------------------------------------
+
+    //! Read radio \p idx's junction temperature via lr20xx_system_get_temp.
+    //! \return true on success
+    bool readDieTemp(FwIndexType idx, I8& tempC);
+
+    //! Sample both radios' die temperature and publish the higher (worst
+    //! case) reading to POLYDB_ENTRY_OBC_LR2021_Temperature. No-op if setPoly
+    //! is unconnected.
+    void sendTempPoly();
+
+    //! Publish an RSSI reading (dBm) to the given PolyDb entry, right after a
+    //! packet RX. No-op if setPoly is unconnected.
+    void sendRssiPoly(Svc::PolyDbCfg::PolyDbEntry entry, I16 rssiDbm);
+
     //! Emit a debug event
     void logDebug(const Fw::LogStringArg& msg);
 

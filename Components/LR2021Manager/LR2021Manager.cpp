@@ -346,6 +346,68 @@ void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
                 break;
         }
     }
+
+    this->sendTempPoly();
+}
+
+// ----------------------------------------------------------------------
+// PolyDb
+// ----------------------------------------------------------------------
+
+bool LR2021Manager ::readDieTemp(FwIndexType idx, I8& tempC) {
+    RadioSlot& r = this->m_radio[idx];
+    uint16_t raw = 0;
+    const lr20xx_status_t status = lr20xx_system_get_temp(
+        &r, LR20XX_SYSTEM_VALUE_FORMAT_RAW, LR20XX_SYSTEM_MEAS_RES_13_BITS, LR20XX_SYSTEM_TEMP_SRC_VBE, &raw);
+    if (status != LR20XX_STATUS_OK) {
+        return false;
+    }
+
+    // Vana (typ. 1.35 V), Vbe25 (typ. 0.7295 V), VbeSlope (typ. -1.7 mV/degC).
+    // See lr20xx_system_get_temp()'s docstring for the derivation.
+    constexpr F32 VANA_V = 1.35f;
+    constexpr F32 VBE25_V = 0.7295f;
+    constexpr F32 VBE_SLOPE_MV_PER_C = -1.7f;
+    const F32 tempF = (static_cast<F32>(raw) / 8192.0f * VANA_V - VBE25_V) * (1000.0f / VBE_SLOPE_MV_PER_C) + 25.0f;
+    tempC = static_cast<I8>(tempF + (tempF >= 0.0f ? 0.5f : -0.5f));
+    return true;
+}
+
+void LR2021Manager ::sendTempPoly() {
+    if (!this->isConnected_setPoly_OutputPort(0)) {
+        return;
+    }
+
+    // Report the higher (worst-case) die temperature of the two radios.
+    bool haveTemp = false;
+    I8 maxTempC = 0;
+    for (FwIndexType i = 0; i < NUM_RADIOS; i++) {
+        I8 tempC = 0;
+        if (this->readDieTemp(i, tempC) && (!haveTemp || (tempC > maxTempC))) {
+            maxTempC = tempC;
+            haveTemp = true;
+        }
+    }
+    if (!haveTemp) {
+        return;
+    }
+
+    Svc::MeasurementStatus polyStatus = Svc::MeasurementStatus::OK;
+    Fw::Time polyTime = this->getTime();
+    Fw::PolyType polyValue = maxTempC;
+    this->setPoly_out(0, Svc::PolyDbCfg::PolyDbEntry::POLYDB_ENTRY_OBC_LR2021_Temperature, polyStatus, polyTime,
+                       polyValue);
+}
+
+void LR2021Manager ::sendRssiPoly(Svc::PolyDbCfg::PolyDbEntry entry, I16 rssiDbm) {
+    if (!this->isConnected_setPoly_OutputPort(0)) {
+        return;
+    }
+
+    Svc::MeasurementStatus polyStatus = Svc::MeasurementStatus::OK;
+    Fw::Time polyTime = this->getTime();
+    Fw::PolyType polyValue = static_cast<int8_t>(rssiDbm);
+    this->setPoly_out(0, entry, polyStatus, polyTime, polyValue);
 }
 
 void LR2021Manager ::dataIn_handler(FwIndexType portNum,
