@@ -55,6 +55,17 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Number of synchronous send retries on the byte-stream driver.
     static constexpr FwIndexType UART_RETRY_LIMIT = 3;
 
+    //! Largest BER-test payload, in bytes (max of the FSK / FLRC payloads).
+    static constexpr U16 BER_MAX_PAYLOAD = 511;
+
+    //! Upper bound on the BER-test packet count (keeps the bit tallies within
+    //! U32: BER_MAX_PACKETS * BER_MAX_PAYLOAD * 8 < 2^32).
+    static constexpr U32 BER_MAX_PACKETS = 1000000;
+
+    //! Grace period after the last BER packet is sent, letting stragglers
+    //! arrive before the result is tallied, in milliseconds.
+    static constexpr U32 BER_DRAIN_MS = 2000;
+
     // ----------------------------------------------------------------------
     // Radio-level types
     // ----------------------------------------------------------------------
@@ -277,6 +288,53 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Poll and handle radio IRQs (TX done / RX done / errors).
     void fskService(RadioSlot& r);
 
+    //! Raw FSK BER-test TX: send \p len bytes verbatim on the BER syncword,
+    //! with no CCSDS coding (implicit fixed length, CRC off so a corrupted
+    //! packet is still delivered for the bit-compare). \return true on success
+    bool fskBerTx(RadioSlot& r, const U8* data, U16 len);
+
+    //! Enter continuous FSK RX on the BER syncword for fixed-length \p len
+    //! packets (raw, no CCSDS coding). \return true on success
+    bool fskBerRx(RadioSlot& r, U16 len);
+
+    // ----------------------------------------------------------------------
+    // BER test (implemented in LR2021Ber.cpp)
+    // ----------------------------------------------------------------------
+
+    //! Arm a BER test: configure \p txRadio and \p rxRadio for \p mode /
+    //! \p freq_hz / \p power_dbm on the dedicated BER channel and start the
+    //! non-blocking send/receive state machine driven by run(). \p txRadio
+    //! and \p rxRadio must differ. \return true if both radios were armed
+    bool berStart(FwIndexType txRadio, FwIndexType rxRadio, RadioMode mode, U32 freq_hz,
+                  I8 power_dbm, U32 num_packets, U16 payload_len, U32 interval_ms);
+
+    //! Advance the running BER test: paces test-packet TX and, once every
+    //! packet is sent plus a drain window, finalizes the result. Called from
+    //! run() each tick; no-op when no test is active.
+    void berDrive();
+
+    //! Finalize the running BER test: emit BerTestDone + telemetry and restore
+    //! both radios to normal continuous RX in their mode.
+    void berFinish();
+
+    //! Transmit one BER test packet (the stored pattern) from slot \p r,
+    //! dispatching to the FSK / FLRC raw TX. \return true on success
+    bool berTxOne(RadioSlot& r);
+
+    //! Called from the FSK / FLRC RX_DONE service: when a BER test is running
+    //! and \p r is its RX radio, read the \p pkt_len received bytes, count bit
+    //! errors against the pattern, re-arm RX, and return true (the caller then
+    //! skips its normal RX forwarding). Returns false otherwise.
+    bool berRxIntercept(RadioSlot& r, U16 pkt_len);
+
+    //! Count the payload bit errors of one received BER packet (\p len bytes)
+    //! against the stored pattern and accumulate into the running tallies.
+    void berCompare(const U8* recv, U16 len);
+
+    //! Fill \p buf with \p len bytes of the deterministic PRBS9 test pattern
+    //! used by both the transmitter and the receiver's reference.
+    static void berFillPattern(U8* buf, U16 len);
+
     // ----------------------------------------------------------------------
     // RF power detectors (implemented in LR2021Adc.cpp)
     // ----------------------------------------------------------------------
@@ -438,6 +496,21 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
                                 U32 duration_s            //!< Test duration in seconds
                                 ) override;
 
+    //! Handler implementation for command RadioBerTest
+    //!
+    //! Measure the over-the-air bit error rate between two radio modules
+    void RadioBerTest_cmdHandler(FwOpcodeType opCode,      //!< The opcode
+                                 U32 cmdSeq,               //!< The command sequence number
+                                 U8 tx_radio,              //!< Transmitting radio index
+                                 U8 rx_radio,              //!< Receiving radio index
+                                 LR2021Manager_Mode mode,  //!< FSK or FLRC
+                                 U32 freq_hz,              //!< RF centre frequency in Hz
+                                 I8 power_dbm,             //!< TX output power in dBm
+                                 U32 num_packets,          //!< Number of test packets
+                                 U16 payload_len,          //!< Test payload length, bytes
+                                 U32 interval_ms           //!< Minimum spacing between packets
+                                 ) override;
+
   private:
     // ----------------------------------------------------------------------
     // Downlink routing / com status helpers
@@ -469,10 +542,43 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     void relayUplink(Fw::Buffer& data);
 
     // ----------------------------------------------------------------------
+    // BER test state (RadioBerTest command, driven by run())
+    // ----------------------------------------------------------------------
+
+    //! Phase of a running BER test.
+    enum class BerPhase {
+        SENDING,   //!< Still transmitting test packets
+        DRAINING   //!< All sent; waiting for the last packets to arrive
+    };
+
+    //! Non-blocking BER test. active gates run()'s send/tally loop and the
+    //! RX-service interception; every field is set by berStart().
+    struct BerTest {
+        bool active = false;
+        BerPhase phase = BerPhase::SENDING;
+        FwIndexType txRadio = 0;
+        FwIndexType rxRadio = 1;
+        RadioMode mode = RadioMode::NONE;
+        U32 freqHz = 0;
+        I8 powerDbm = 0;
+        U32 totalPackets = 0;   //!< Packets to transmit
+        U16 payloadLen = 0;     //!< Bytes per packet
+        U32 intervalMs = 0;     //!< Minimum spacing between packets
+        U32 sentCount = 0;      //!< Packets transmitted so far
+        U32 recvCount = 0;      //!< Packets received so far
+        U32 bitErrors = 0;      //!< Payload bit errors counted so far
+        U32 totalBits = 0;      //!< Payload bits compared so far
+        Fw::Time nextTxTime;    //!< Earliest time to send the next packet
+        Fw::Time drainEnd;      //!< Deadline that ends the drain phase
+        U8 pattern[BER_MAX_PAYLOAD];  //!< Reference PRBS9 payload pattern
+    };
+
+    // ----------------------------------------------------------------------
     // State
     // ----------------------------------------------------------------------
 
     RadioSlot m_radio[NUM_RADIOS];  //!< Per-radio state (driver contexts)
+    BerTest m_ber;                  //!< Running / last BER test state
     FwIndexType m_txRoute[TX_ROUTE_TABLE_SIZE] = {0};  //!< comQueueIndex -> radio
     RxSink m_rxSink = RxSink::DATA_OUT;                 //!< Destination for received packets
     bool m_comOpen = false;         //!< Initial comStatus READY emitted / flow open

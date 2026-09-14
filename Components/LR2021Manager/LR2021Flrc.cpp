@@ -276,6 +276,12 @@ void LR2021Manager ::flrcService(RadioSlot& r) {
             pkt_len = FLRC_MAX_PAYLOAD;
         }
 
+        // BER test: when this is the test's RX radio, tally the raw packet and
+        // re-arm; skip the normal forward to the com stack.
+        if (this->berRxIntercept(r, pkt_len)) {
+            return;
+        }
+
         lr20xx_radio_flrc_pkt_status_t pkt_status = {};
         (void)lr20xx_radio_flrc_get_pkt_status(&r, &pkt_status);
 

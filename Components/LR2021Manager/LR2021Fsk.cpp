@@ -553,6 +553,12 @@ void LR2021Manager ::fskService(RadioSlot& r) {
             pkt_len = FSK_MAX_PAYLOAD;
         }
 
+        // BER test: when this is the test's RX radio, tally the raw packet and
+        // re-arm on the BER channel; skip the normal CCSDS decode / forward.
+        if (this->berRxIntercept(r, pkt_len)) {
+            return;
+        }
+
         lr20xx_radio_fsk_packet_status_t pkt_status = {};
         (void)lr20xx_radio_fsk_get_packet_status(&r, &pkt_status);
 
@@ -607,6 +613,118 @@ void LR2021Manager ::fskService(RadioSlot& r) {
         r.txInFlight = false;
         this->log_WARNING_HI_FskError(static_cast<U8>(r.idx), static_cast<U32>(irq));
     }
+}
+
+// ----------------------------------------------------------------------
+// Raw FSK BER-test path (RadioBerTest command)
+//
+// A deliberately minimal TX/RX pair that bypasses the CCSDS role coding
+// (no RS / CLTU / randomization): the payload goes on the air verbatim on
+// the dedicated BER syncword, with an implicit fixed length and CRC off, so
+// even a corrupted packet is delivered for the software bit-compare. Reuses
+// the modulation / PA / band setup already applied by fskInit(); only the
+// syncword, packet params and FIFO differ per operation.
+// ----------------------------------------------------------------------
+
+bool LR2021Manager ::fskBerTx(RadioSlot& r, const U8* data, U16 len) {
+    if ((r.mode != RadioMode::FSK) || (data == nullptr) || (len == 0) || (len > FSK_MAX_PAYLOAD)) {
+        return false;
+    }
+    if (r.txInFlight) {
+        return false;
+    }
+
+    lr20xx_status_t status = lr20xx_radio_fsk_set_syncword(&r, FSK_BER_SYNCWORD, FSK_BER_SYNCWORD_BITS,
+                                                           LR20XX_RADIO_FSK_SYNCWORD_MSBF);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("BER TX set_syncword failed (%d)", status);
+        return false;
+    }
+
+    // Implicit fixed length == len, CRC off (fskPktParams uses FSK_HEADER_MODE
+    // / FSK_CRC, both of which default to implicit / off).
+    const lr20xx_radio_fsk_pkt_params_t pkt_params = fskPktParams(len, false);
+    status = lr20xx_radio_fsk_set_packet_params(&r, &pkt_params);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("BER TX set_packet_params failed (%d)", status);
+        return false;
+    }
+
+    status = lr20xx_radio_fifo_clear_tx(&r);
+    if (status != LR20XX_STATUS_OK) {
+        return false;
+    }
+    status = lr20xx_radio_fifo_write_tx(&r, data, len);
+    if (status != LR20XX_STATUS_OK) {
+        return false;
+    }
+
+    const U32 tx_freq = r.txFreqHz ? r.txFreqHz : r.freqHz;
+    if (!this->fskTune(r, tx_freq)) {
+        return false;
+    }
+
+    status = lr20xx_radio_common_set_tx(&r, FSK_TX_TIMEOUT_MS);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("BER TX set_tx failed (%d)", status);
+        return false;
+    }
+    r.txInFlight = true;
+    return true;
+}
+
+bool LR2021Manager ::fskBerRx(RadioSlot& r, U16 len) {
+    if (r.mode != RadioMode::FSK) {
+        return false;
+    }
+
+    // Same post-TX / cold-TCXO grace as fskRx(): the chip can hold BUSY high
+    // for a long time after a transmission before it takes another command.
+    if (!this->waitOnBusy(r.idx, 2000000)) {
+        DEBUG("BER RX BUSY never released (2 s)");
+        return false;
+    }
+    lr20xx_status_t status = lr20xx_system_set_standby_mode(&r, LR20XX_SYSTEM_STANDBY_MODE_XOSC);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("BER RX set_standby failed (%d)", status);
+        return false;
+    }
+    if (!this->waitOnBusy(r.idx, 2500000)) {
+        DEBUG("BER RX XOSC standby entry timed out");
+        return false;
+    }
+
+    status = lr20xx_radio_fsk_set_syncword(&r, FSK_BER_SYNCWORD, FSK_BER_SYNCWORD_BITS,
+                                           LR20XX_RADIO_FSK_SYNCWORD_MSBF);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("BER RX set_syncword failed (%d)", status);
+        return false;
+    }
+
+    const lr20xx_radio_fsk_pkt_params_t pkt_params = fskPktParams(len, false);
+    status = lr20xx_radio_fsk_set_packet_params(&r, &pkt_params);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("BER RX set_packet_params failed (%d)", status);
+        return false;
+    }
+
+    status = lr20xx_radio_fifo_clear_rx(&r);
+    if (status != LR20XX_STATUS_OK) {
+        return false;
+    }
+
+    const U32 rx_freq = r.rxFreqHz ? r.rxFreqHz : r.freqHz;
+    if (!this->fskTune(r, rx_freq)) {
+        return false;
+    }
+
+    status = lr20xx_radio_common_set_rx_with_timeout_in_rtc_step(&r, FSK_RX_CONTINUOUS);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("BER RX set_rx failed (%d)", status);
+        return false;
+    }
+    r.rxContinuous = true;
+    return true;
 }
 
 }  // namespace LR2021

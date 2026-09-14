@@ -431,6 +431,11 @@ void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
                 break;
         }
     }
+
+    // Drive the non-blocking BER test (if one is running): the per-slot
+    // service above already cleared txInFlight / tallied any RX_DONE this
+    // tick, so berDrive() can send the next packet or finalize now.
+    this->berDrive();
 }
 
 // ----------------------------------------------------------------------
@@ -450,7 +455,7 @@ bool LR2021Manager ::readDieTemp(FwIndexType idx, I8& tempC) {
     if (status != LR20XX_STATUS_OK) {
         return false;
     }
-    DEBUG("readDieTemp raw=%u", raw);
+    // DEBUG("readDieTemp raw=%u", raw);
 
     // A raw of 0 means no valid conversion happened (MU ADC not in STDBY_XOSC):
     // reject it so we never publish a bogus temperature into PolyDb.
@@ -523,6 +528,21 @@ void LR2021Manager ::dataIn_handler(FwIndexType portNum,
     // through the route table (telemetry / events -> UHF, file -> S-band, or
     // the byte-stream UART target).
     const FwIndexType idx = this->routeTx(context);
+
+    // A running BER test owns both of its radios: drop any downlink frame
+    // routed to one of them so the raw test traffic is not corrupted.
+    if (this->m_ber.active && ((idx == this->m_ber.txRadio) || (idx == this->m_ber.rxRadio))) {
+        this->log_WARNING_HI_TxFrameDropped(static_cast<U8>(idx));
+        if (this->isConnected_dataReturnOut_OutputPort(0)) {
+            this->dataReturnOut_out(0, data, context);
+        }
+        if (this->isConnected_comStatusOut_OutputPort(0)) {
+            Fw::Success failure = Fw::Success::FAILURE;
+            this->comStatusOut_out(0, failure);
+        }
+        this->m_comOpen = false;
+        return;
+    }
 
     // UART target: synchronous send straight to the byte-stream driver, then
     // return the buffer and grant the next comStatus credit (like ComStub's
@@ -629,6 +649,12 @@ void LR2021Manager ::relayUplink(Fw::Buffer& data) {
     // targets can share the host UART.
     const FwIndexType idx = 0;
     RadioSlot& r = this->m_radio[idx];
+
+    // Drop the relay while a BER test owns this radio (it is mid raw test TX/RX).
+    if (this->m_ber.active && ((idx == this->m_ber.txRadio) || (idx == this->m_ber.rxRadio))) {
+        DEBUG("radio %d uplink relay dropped (BER test active)", static_cast<int>(idx));
+        return;
+    }
 
     // No working buffer / comStatus crediting for a relay: flrcTx/fskTx copy
     // the payload into the radio FIFO synchronously, so the source buffer is
@@ -847,6 +873,62 @@ void LR2021Manager ::RadioTxTest_cmdHandler(FwOpcodeType opCode,
     const bool ok = this->txTest(radio, target, freq_hz, power_dbm, duration_s);
     if (!ok) {
         this->log_WARNING_HI_TxTestError(radio);
+    }
+    this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
+}
+
+void LR2021Manager ::RadioBerTest_cmdHandler(FwOpcodeType opCode,
+                                             U32 cmdSeq,
+                                             U8 tx_radio,
+                                             U8 rx_radio,
+                                             LR2021Manager_Mode mode,
+                                             U32 freq_hz,
+                                             I8 power_dbm,
+                                             U32 num_packets,
+                                             U16 payload_len,
+                                             U32 interval_ms) {
+    if ((tx_radio >= NUM_RADIOS) || (rx_radio >= NUM_RADIOS)) {
+        this->log_WARNING_LO_BadRadioIndex((tx_radio >= NUM_RADIOS) ? tx_radio : rx_radio);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+
+    // Only the packet engines can carry a raw pattern; CW is unmodulated.
+    RadioMode target = RadioMode::NONE;
+    switch (mode.e) {
+        case LR2021Manager_Mode::FLRC:
+            target = RadioMode::FLRC;
+            break;
+        case LR2021Manager_Mode::FSK:
+            target = RadioMode::FSK;
+            break;
+        default:
+            break;
+    }
+
+    // The minimum FLRC payload the radio accepts is FLRC_MIN_PAYLOAD; FSK
+    // accepts any non-zero length.
+    const U16 min_len = (target == RadioMode::FLRC) ? FLRC_MIN_PAYLOAD : 1;
+    const bool valid = (target != RadioMode::NONE) && (tx_radio != rx_radio) &&
+                       (num_packets >= 1) && (num_packets <= BER_MAX_PACKETS) &&
+                       (payload_len >= min_len) && (payload_len <= BER_MAX_PAYLOAD);
+    if (!valid || this->m_ber.active) {
+        // Invalid args, or a test is already running (reject rather than
+        // clobber the one in progress).
+        this->log_WARNING_HI_BerTestError(tx_radio, rx_radio);
+        this->cmdResponse_out(opCode, cmdSeq,
+                              this->m_ber.active ? Fw::CmdResponse::BUSY : Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+
+    // Non-blocking: berStart arms both radios and the run() state machine
+    // paces the TX / tallies the RX; BerTestDone is emitted by berFinish().
+    this->log_ACTIVITY_HI_BerTestStarted(tx_radio, rx_radio, mode, num_packets);
+    const bool ok = this->berStart(tx_radio, rx_radio, target, freq_hz, power_dbm, num_packets,
+                                   payload_len, interval_ms);
+    if (!ok) {
+        this->m_ber.active = false;
+        this->log_WARNING_HI_BerTestError(tx_radio, rx_radio);
     }
     this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
 }

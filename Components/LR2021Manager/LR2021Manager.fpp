@@ -184,6 +184,29 @@ module LR2021 {
             duration_s: U32 @< How long to key the test TX, in seconds
         )
 
+        @ Bench BER test: measure the bit error rate between two radio modules
+        @ over the air. One radio (tx_radio) transmits num_packets frames of a
+        @ fixed PRBS9 pattern; the other (rx_radio) receives them and the
+        @ software counts bit errors against the known pattern. The raw path
+        @ bypasses all CCSDS coding (no RS / CLTU / randomization) so the result
+        @ is the true channel BER. Both radios are (re)configured to the same
+        @ mode / freq / power on their own dedicated BER syncword, so they must
+        @ be on the same band and coupled (coax + attenuator on the bench).
+        @ mode must be FSK or FLRC (CW is rejected). Non-blocking: the command
+        @ returns once the test is armed (BerTestStarted); run() paces the TX,
+        @ tallies RX, and emits BerTestDone with the result when it finishes.
+        @ Downlink frames routed to either radio are dropped while a test runs.
+        async command RadioBerTest(
+            tx_radio: U8 @< Transmitting radio index (0 or 1)
+            rx_radio: U8 @< Receiving radio index (0 or 1), must differ from tx_radio
+            mode: Mode @< FSK or FLRC packet engine for the test
+            freq_hz: U32 @< RF centre frequency in Hz (same for both radios)
+            power_dbm: I8 @< TX output power in dBm
+            num_packets: U32 @< Number of test packets to transmit
+            payload_len: U16 @< Test payload length per packet, in bytes
+            interval_ms: U32 @< Minimum spacing between packets, in ms (0 = as fast as possible)
+        )
+
         # ----------------------------------------------------------------------
         # Events
         # ----------------------------------------------------------------------
@@ -232,6 +255,22 @@ module LR2021 {
         @ carrier / RX restore failed to key
         event TxTestError(radio: U8) severity warning high \
             format "Radio {} TX test failed (invalid mode or radio error)"
+
+        @ RadioBerTest armed: transmitting the PRBS9 test packets
+        event BerTestStarted(tx_radio: U8, rx_radio: U8, mode: Mode, num_packets: U32) \
+            severity activity high \
+            format "BER test started: radio {} -> {} ({}), {} packets"
+
+        @ RadioBerTest finished: reports the measured bit error rate
+        event BerTestDone(tx_radio: U8, rx_radio: U8, sent: U32, received: U32, \
+                          lost: U32, bit_errors: U32, total_bits: U32, ber_ppm: U32) \
+            severity activity high \
+            format "BER test done: radio {} -> {}, sent {}, rx {}, lost {}, bit errors {}/{}, BER {} ppm"
+
+        @ RadioBerTest given a bad mode / radio pair, or a radio operation
+        @ failed while arming or running the test
+        event BerTestError(tx_radio: U8, rx_radio: U8) severity warning high \
+            format "BER test failed (radio {} -> {}): invalid args or radio error"
 
         @ A downlink frame could not be transmitted and was dropped
         event TxFrameDropped(radio: U8) severity warning high \
@@ -289,6 +328,21 @@ module LR2021 {
         @ PA ramps up. High reflected vs forward power indicates a bad
         @ antenna match / disconnected antenna.
         telemetry RfPower: RfPower update on change
+
+        @ Total bit errors counted in the last / running BER test
+        telemetry BerBitErrors: U32 update on change
+
+        @ Total payload bits compared in the last / running BER test
+        telemetry BerBitsTotal: U32 update on change
+
+        @ Bit error rate of the last BER test, in parts per million (errors/bits)
+        telemetry BerRatePpm: U32 update on change
+
+        @ Packets received during the last / running BER test
+        telemetry BerPacketsRecv: U32 update on change
+
+        @ Packets transmitted but not received during the last BER test
+        telemetry BerPacketsLost: U32 update on change
 
         # ----------------------------------------------------------------------
         # Radio interface ports

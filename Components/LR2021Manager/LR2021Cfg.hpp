@@ -191,6 +191,15 @@ constexpr uint8_t FSK_TC_TX_SYNCWORD[LR20XX_RADIO_FSK_SYNCWORD_LENGTH] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x55, 0xEB, 0x90};
 constexpr uint8_t FSK_TC_TX_SYNCWORD_BITS = 24;
 
+// BER-test channel (RadioBerTest command, bench only): a dedicated 32-bit
+// syncword so the raw PRBS test packets never collide with the TM / TC CCSDS
+// channels and the receiving radio only counts the test frames. The raw BER
+// path (fskBerTx / fskBerRx) bypasses all CCSDS coding (no RS / CLTU /
+// randomization) so the software bit-compare measures the true channel BER.
+constexpr uint8_t FSK_BER_SYNCWORD[LR20XX_RADIO_FSK_SYNCWORD_LENGTH] = {
+    0x00, 0x00, 0x00, 0x00, 0x93, 0x0B, 0x51, 0xDE};
+constexpr uint8_t FSK_BER_SYNCWORD_BITS = 32;
+
 // ---------------------------------------------------------------------------
 // CLTU (CCSDS 231.0-B) parameters for the TC uplink
 // ---------------------------------------------------------------------------
