@@ -77,6 +77,16 @@ bool LR2021Manager ::radioInit(FwIndexType idx) {
         (void)lr20xx_system_clear_errors(&r);
     }
 
+    // Calibrate the Measure Unit ADC. Without this one-time boot calibration
+    // the ADC-backed measurements (GetTemp / GetVbat) return 0. Per the driver
+    // docstring this "should be executed at boot" and, for the MU block,
+    // "initial calibration is enough". Calibrate returns the chip to STDBY_RC.
+    status = lr20xx_system_calibrate(&r, LR20XX_SYSTEM_CALIB_MU_MASK);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("calibrate (MU ADC) failed (%d)", status);
+        return false;
+    }
+
     // DIO routing is MODULE-specific (each module wires its RF switch tree
     // and IRQ pad differently). Getting this wrong gives "TX started" with
     // no RF (antenna switch never closes) and no TX_DONE seen by the MCU

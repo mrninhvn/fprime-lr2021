@@ -460,6 +460,11 @@ bool LR2021Manager ::fskRx(RadioSlot& r, U32 timeout_ms) {
         return false;
     }
 
+    // The radio is now in STDBY_XOSC, the only state where the Measure Unit ADC
+    // converts. Sample die temperature here (once per TX->RX turnaround) before
+    // re-arming RX.
+    this->publishTempPoly(r.idx);
+
     // Restore the receive-channel configuration of this role (a TX may have
     // switched the syncword / packet length to the transmit channel).
     // SPACECRAFT receives TC CLTUs; GROUND receives TM frames.

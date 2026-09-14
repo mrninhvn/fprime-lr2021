@@ -25,6 +25,7 @@ module LR2021 {
         enum Mode {
             FLRC @< Fast Long Range Communication
             FSK @< GMSK Frequency Shift Keying
+            CW @< Bench test: unmodulated carrier, no link (downlink frames dropped)
         }
 
         @ Downlink source queue routed by SET_TX_ROUTE. Values match the

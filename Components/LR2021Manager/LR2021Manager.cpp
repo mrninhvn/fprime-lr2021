@@ -273,6 +273,25 @@ bool LR2021Manager ::setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 po
         case RadioMode::FSK:
             ok = this->fskInit(r, freq_hz, power_dbm) && this->fskRx(r, 0);
             break;
+        case RadioMode::CW:
+            // Reuse fskInit for band/PA-path selection, frequency and TX
+            // power (pkt_type/modulation params are irrelevant to a raw
+            // carrier), then key the test-mode carrier instead of fskRx().
+            ok = this->fskInit(r, freq_hz, power_dbm);
+            if (ok) {
+                ok = this->txCw(idx, freq_hz, power_dbm);
+                // const lr20xx_status_t st =
+                //     lr20xx_radio_common_set_tx_test_mode(&r, LR20XX_RADIO_COMMON_TX_TEST_MODE_CONTINUOUS_WAVE);
+                // lr20xx_radio_common_set_tx(&r, 0);
+                // ok = (st == LR20XX_STATUS_OK);
+            }
+            if (ok) {
+                // fskInit() stamps r.mode = FSK; override so run()/dataIn's
+                // per-mode switches fall through their default (no service,
+                // no TX) while the carrier is up.
+                r.mode = RadioMode::CW;
+            }
+            break;
         default:
             break;
     }
@@ -346,8 +365,6 @@ void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
                 break;
         }
     }
-
-    this->sendTempPoly();
 }
 
 // ----------------------------------------------------------------------
@@ -356,47 +373,70 @@ void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
 
 bool LR2021Manager ::readDieTemp(FwIndexType idx, I8& tempC) {
     RadioSlot& r = this->m_radio[idx];
+
+    // The Measure Unit ADC only converts in STDBY_XOSC (it returns a stale 0
+    // during TX/RX), and must have been calibrated at boot (radioInit calls
+    // lr20xx_system_calibrate with LR20XX_SYSTEM_CALIB_MU_MASK). Callers read
+    // this on the TX->RX turnaround, while the radio is briefly in STDBY_XOSC.
     uint16_t raw = 0;
     const lr20xx_status_t status = lr20xx_system_get_temp(
-        &r, LR20XX_SYSTEM_VALUE_FORMAT_RAW, LR20XX_SYSTEM_MEAS_RES_13_BITS, LR20XX_SYSTEM_TEMP_SRC_VBE, &raw);
+        &r, LR20XX_SYSTEM_VALUE_FORMAT_RAW, LR20XX_SYSTEM_MEAS_RES_12_BITS, LR20XX_SYSTEM_TEMP_SRC_VBE, &raw);
     if (status != LR20XX_STATUS_OK) {
+        return false;
+    }
+    DEBUG("readDieTemp raw=%u", raw);
+
+    // A raw of 0 means no valid conversion happened (MU ADC not in STDBY_XOSC):
+    // reject it so we never publish a bogus temperature into PolyDb.
+    if (raw == 0) {
         return false;
     }
 
     // Vana (typ. 1.35 V), Vbe25 (typ. 0.7295 V), VbeSlope (typ. -1.7 mV/degC).
-    // See lr20xx_system_get_temp()'s docstring for the derivation.
+    // See lr20xx_system_get_temp()'s docstring for the derivation. NOTE: the
+    // driver's get_temp right-shifts the 13-bit measurement by 3 (unlike
+    // get_vbat, which does not), so the docstring's /8192 becomes /1024 here.
+    // Verified against get_vbat: raw 542 -> ~34 C, sane for an operating die.
     constexpr F32 VANA_V = 1.35f;
     constexpr F32 VBE25_V = 0.7295f;
     constexpr F32 VBE_SLOPE_MV_PER_C = -1.7f;
-    const F32 tempF = (static_cast<F32>(raw) / 8192.0f * VANA_V - VBE25_V) * (1000.0f / VBE_SLOPE_MV_PER_C) + 25.0f;
+    F32 tempF = (static_cast<F32>(raw) / 1024.0f * VANA_V - VBE25_V) * (1000.0f / VBE_SLOPE_MV_PER_C) + 25.0f;
+    // Clamp to the I8 telemetry range so an out-of-range reading can't wrap.
+    if (tempF > 127.0f) {
+        tempF = 127.0f;
+    } else if (tempF < -128.0f) {
+        tempF = -128.0f;
+    }
     tempC = static_cast<I8>(tempF + (tempF >= 0.0f ? 0.5f : -0.5f));
     return true;
 }
 
-void LR2021Manager ::sendTempPoly() {
+void LR2021Manager ::publishTempPoly(FwIndexType idx) {
+    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
     if (!this->isConnected_setPoly_OutputPort(0)) {
         return;
     }
 
-    // Report the higher (worst-case) die temperature of the two radios.
-    bool haveTemp = false;
-    I8 maxTempC = 0;
-    for (FwIndexType i = 0; i < NUM_RADIOS; i++) {
-        I8 tempC = 0;
-        if (this->readDieTemp(i, tempC) && (!haveTemp || (tempC > maxTempC))) {
-            maxTempC = tempC;
-            haveTemp = true;
-        }
-    }
-    if (!haveTemp) {
+    // Read the die temperature. The caller must invoke this only while the
+    // radio is in STDBY_XOSC (the MU ADC does not convert during TX/RX): that
+    // is the case on the TX->RX turnaround, inside fskRx()/flrcRx() after the
+    // set_standby(XOSC) step and before set_rx.
+    I8 tempC = 0;
+    if (!this->readDieTemp(idx, tempC)) {
         return;
     }
 
+    // Each module reports to its own PolyDb entry.
+    const Svc::PolyDbCfg::PolyDbEntry entry =
+        (this->m_radio[idx].moduleType == ModuleType::NICERF)
+            ? Svc::PolyDbCfg::PolyDbEntry::POLYDB_ENTRY_OBC_NICERF_Temperature
+            : Svc::PolyDbCfg::PolyDbEntry::POLYDB_ENTRY_OBC_REYAX_Temperature;
+
     Svc::MeasurementStatus polyStatus = Svc::MeasurementStatus::OK;
     Fw::Time polyTime = this->getTime();
-    Fw::PolyType polyValue = maxTempC;
-    this->setPoly_out(0, Svc::PolyDbCfg::PolyDbEntry::POLYDB_ENTRY_OBC_LR2021_Temperature, polyStatus, polyTime,
-                       polyValue);
+    Fw::PolyType polyValue = tempC;
+    this->setPoly_out(0, entry, polyStatus, polyTime, polyValue);
+    DEBUG("radio %d die temp %d C", static_cast<int>(idx), static_cast<int>(tempC));
 }
 
 void LR2021Manager ::sendRssiPoly(Svc::PolyDbCfg::PolyDbEntry entry, I16 rssiDbm) {
@@ -593,6 +633,9 @@ void LR2021Manager ::RadioSetMode_cmdHandler(FwOpcodeType opCode,
         case LR2021Manager_Mode::FSK:
             target = RadioMode::FSK;
             break;
+        case LR2021Manager_Mode::CW:
+            target = RadioMode::CW;
+            break;
         default:
             break;
     }
@@ -638,6 +681,9 @@ void LR2021Manager ::RadioSetModulation_cmdHandler(FwOpcodeType opCode, U32 cmdS
             break;
         case LR2021Manager_Mode::FSK:
             target = RadioMode::FSK;
+            break;
+        case LR2021Manager_Mode::CW:
+            target = RadioMode::CW;
             break;
         default:
             break;

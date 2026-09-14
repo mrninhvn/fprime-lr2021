@@ -59,8 +59,11 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     // Radio-level types
     // ----------------------------------------------------------------------
 
-    //! Active modulation / packet engine of one radio.
-    enum class RadioMode { NONE, FLRC, FSK };
+    //! Active modulation / packet engine of one radio. CW is a bench-test
+    //! state (unmodulated carrier, no packet engine): run()/dataIn treat it
+    //! like NONE (service/TX no-ops via their switch default), so a radio
+    //! holding a carrier never gets IRQ-serviced or handed a downlink frame.
+    enum class RadioMode { NONE, FLRC, FSK, CW };
 
     //! Destination for received (uplink) packets.
     //!   DATA_OUT: the Svc.Com dataOut port (frame accumulator / deframer);
@@ -188,16 +191,17 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! its module type, regulator).
     bool radioInit(FwIndexType idx);
 
-    //! Configure radio \p idx for \p mode and enter continuous RX. Used for
-    //! the startup default (topology) and by the SET_MODE command.
+    //! Configure radio \p idx for \p mode and enter continuous RX (or, for
+    //! RadioMode::CW, key an unmodulated carrier instead). Used for the
+    //! startup default (topology) and by the RadioSetMode/RadioReset commands.
     //! Aborts any in-flight TX of that radio, returning its buffer.
     //! \return true on success
     bool setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 power_dbm);
 
-    //! Bench test: key an unmodulated continuous-wave carrier on radio \p idx
-    //! at \p freq_hz / \p power_dbm (keep freq_hz in the band selected by the
-    //! preceding setMode). Stays on until the next setMode()/RESET. Meant to
-    //! be called at boot for spectrum-analyser measurements.
+    //! Bench test convenience: key an unmodulated continuous-wave carrier on
+    //! radio \p idx at \p freq_hz / \p power_dbm. Thin wrapper around
+    //! setMode(idx, RadioMode::CW, freq_hz, power_dbm); stays on until the
+    //! next setMode()/RESET.
     //! \return true on success
     bool txCw(FwIndexType idx, U32 freq_hz, I8 power_dbm);
 
@@ -276,13 +280,16 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     // ----------------------------------------------------------------------
 
     //! Read radio \p idx's junction temperature via lr20xx_system_get_temp.
+    //! The Measure Unit ADC only converts in STDBY_XOSC (it reads 0 during
+    //! TX/RX), so the radio must be in STDBY_XOSC when this is called.
     //! \return true on success
     bool readDieTemp(FwIndexType idx, I8& tempC);
 
-    //! Sample both radios' die temperature and publish the higher (worst
-    //! case) reading to POLYDB_ENTRY_OBC_LR2021_Temperature. No-op if setPoly
-    //! is unconnected.
-    void sendTempPoly();
+    //! Read radio \p idx's die temperature and publish it to that module's
+    //! PolyDb entry (NiceRF vs RY42F). Must be called while the radio is in
+    //! STDBY_XOSC (e.g. the TX->RX turnaround in fskRx/flrcRx). No-op if
+    //! setPoly is unconnected or the read fails.
+    void publishTempPoly(FwIndexType idx);
 
     //! Publish an RSSI reading (dBm) to the given PolyDb entry, right after a
     //! packet RX. No-op if setPoly is unconnected.

@@ -198,6 +198,12 @@ bool LR2021Manager ::flrcRx(RadioSlot& r, U32 timeout_ms) {
         return false;
     }
 
+    // On the post-TX turnaround the radio has fallen back to STDBY_XOSC (the
+    // only state where the Measure Unit ADC converts), so sample die temperature
+    // here before re-arming RX. At initial bring-up the chip is in STDBY_RC and
+    // readDieTemp simply reads 0 and skips publishing.
+    this->publishTempPoly(r.idx);
+
     // Restore max payload length so any packet size is accepted (VAR_LEN).
     const lr20xx_radio_flrc_pkt_params_t pkt_params = flrcPktParams(FLRC_MAX_PAYLOAD);
     lr20xx_status_t status = lr20xx_radio_flrc_set_pkt_params(&r, &pkt_params);
