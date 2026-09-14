@@ -167,6 +167,23 @@ module LR2021 {
             target: U8 @< Radio index (0 or 1), or 2 for UART
         )
 
+        @ Bench test: key a continuous PRBS9-modulated carrier (FSK or FLRC,
+        @ whichever packet engine is requested) at freq_hz/power_dbm for
+        @ duration_s seconds, then automatically restore normal continuous RX
+        @ in that mode. mode must be FSK or FLRC (CW is rejected; use
+        @ RadioSetMode for an unmodulated carrier instead). Non-blocking: the
+        @ command returns as soon as the carrier is keyed (TxTestStarted);
+        @ run() stops it and emits TxTestDone once the deadline passes. Only
+        @ the tested radio is paused; the other keeps running. Bench /
+        @ RF-characterisation only.
+        async command RadioTxTest(
+            radio: U8 @< Radio index (0 or 1)
+            mode: Mode @< FSK or FLRC packet engine to key the test pattern on
+            freq_hz: U32 @< RF centre frequency in Hz
+            power_dbm: I8 @< TX output power in dBm
+            duration_s: U32 @< How long to key the test TX, in seconds
+        )
+
         # ----------------------------------------------------------------------
         # Events
         # ----------------------------------------------------------------------
@@ -202,6 +219,19 @@ module LR2021 {
         @ SET_TX_ROUTE target out of range (not a valid radio index or UART)
         event BadRouteTarget(target: U8) severity warning low \
             format "Invalid route target {}"
+
+        @ RadioTxTest started: keying the PRBS9 test carrier
+        event TxTestStarted(radio: U8, mode: Mode, duration_s: U32) severity activity high \
+            format "Radio {} TX test ({}) started for {} s"
+
+        @ RadioTxTest finished: normal continuous RX restored
+        event TxTestDone(radio: U8) severity activity high \
+            format "Radio {} TX test done, RX restored"
+
+        @ RadioTxTest given a mode other than FSK/FLRC (e.g. CW), or the test
+        @ carrier / RX restore failed to key
+        event TxTestError(radio: U8) severity warning high \
+            format "Radio {} TX test failed (invalid mode or radio error)"
 
         @ A downlink frame could not be transmitted and was dropped
         event TxFrameDropped(radio: U8) severity warning high \

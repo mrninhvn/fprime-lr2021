@@ -99,6 +99,15 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
         bool txInFlight = false;    //!< TX started, TX_DONE not yet seen
         Fw::Buffer workingBuffer;   //!< Buffer of the in-flight TX
         ComCfg::FrameContext workingContext;  //!< Frame context of the in-flight TX
+
+        // Timed PRBS9 TX test (RadioTxTest command). Non-blocking: the carrier
+        // is keyed, then run() stops it and restores RX once the deadline
+        // passes -- blocking the thread would overflow the async message queue.
+        bool txTesting = false;                    //!< A timed test carrier is up on this slot
+        Fw::Time txTestEnd;                        //!< Wall-clock deadline to stop it
+        RadioMode txTestMode = RadioMode::NONE;    //!< Mode to restore when the test ends
+        U32 txTestFreqHz = 0;                      //!< Frequency to restore
+        I8 txTestPowerDbm = 0;                     //!< Power to restore
     };
 
     // ----------------------------------------------------------------------
@@ -204,6 +213,16 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! next setMode()/RESET.
     //! \return true on success
     bool txCw(FwIndexType idx, U32 freq_hz, I8 power_dbm);
+
+    //! Bench test: key a continuous PRBS9-modulated carrier on radio \p idx
+    //! (packet engine selected by \p mode, FSK or FLRC only) at \p freq_hz /
+    //! \p power_dbm for \p duration_s seconds. Non-blocking: keys the carrier
+    //! and schedules its own stop in run() at the deadline (blocking would
+    //! overflow the async message queue). run() restores continuous RX in
+    //! \p mode when the deadline passes.
+    //! \return true if the carrier was keyed (false if mode is not FSK/FLRC,
+    //!         or a radio operation failed -- RX is restored best-effort)
+    bool txTest(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 power_dbm, U32 duration_s);
 
     // ----------------------------------------------------------------------
     // FLRC radio operations (implemented in LR2021Flrc.cpp)
@@ -406,6 +425,18 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
                                  LR2021Manager_RouteQueue source,  //!< Downlink source to retarget
                                  U8 target                        //!< Radio index (0/1) or UART_RADIO
                                  ) override;
+
+    //! Handler implementation for command RadioTxTest
+    //!
+    //! Key a continuous PRBS9-modulated test carrier for a bounded duration
+    void RadioTxTest_cmdHandler(FwOpcodeType opCode,      //!< The opcode
+                                U32 cmdSeq,               //!< The command sequence number
+                                U8 radio,                 //!< Radio index
+                                LR2021Manager_Mode mode,  //!< FSK or FLRC
+                                U32 freq_hz,              //!< RF centre frequency in Hz
+                                I8 power_dbm,             //!< TX output power in dBm
+                                U32 duration_s            //!< Test duration in seconds
+                                ) override;
 
   private:
     // ----------------------------------------------------------------------

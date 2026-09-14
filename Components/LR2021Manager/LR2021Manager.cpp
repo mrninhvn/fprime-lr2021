@@ -259,11 +259,14 @@ bool LR2021Manager ::setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 po
     RadioSlot& r = this->m_radio[idx];
 
     // A mode switch aborts any in-flight TX: drop the frame, returning its
-    // buffer (if it owns one) to the framer.
+    // buffer (if it owns one) to the framer. It also cancels any pending
+    // timed TX test on this slot (setMode is how run() restores RX after a
+    // test, and an explicit command should override a running test too).
     if (r.txInFlight && r.workingBuffer.isValid()) {
         this->txComplete(r, Fw::Success::FAILURE);
     }
     r.txInFlight = false;
+    r.txTesting = false;
 
     bool ok = false;
     switch (mode) {
@@ -276,14 +279,24 @@ bool LR2021Manager ::setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 po
         case RadioMode::CW:
             // Reuse fskInit for band/PA-path selection, frequency and TX
             // power (pkt_type/modulation params are irrelevant to a raw
-            // carrier), then key the test-mode carrier instead of fskRx().
+            // carrier), then key the carrier with set_tx_test_mode().
+            // NOTE 1: set_tx_test_mode() itself starts transmitting (it is the
+            //   whole of ral_lr20xx_set_tx_cw()); do NOT follow it with
+            //   set_tx() -- a normal TX entry after it cancels the test
+            //   carrier (verified on HW: adding set_tx() stopped CW).
+            // NOTE 2: fskInit() leaves the chip in STANDBY_RC, which powers the
+            //   (NiceRF) TCXO down; set_tx_test_mode() does not ramp it up on
+            //   its own, so the carrier never radiates. Enter STANDBY_XOSC
+            //   first so the HF clock is running (matches the proven sequence).
             ok = this->fskInit(r, freq_hz, power_dbm);
             if (ok) {
-                ok = this->txCw(idx, freq_hz, power_dbm);
-                // const lr20xx_status_t st =
-                //     lr20xx_radio_common_set_tx_test_mode(&r, LR20XX_RADIO_COMMON_TX_TEST_MODE_CONTINUOUS_WAVE);
-                // lr20xx_radio_common_set_tx(&r, 0);
-                // ok = (st == LR20XX_STATUS_OK);
+                const lr20xx_status_t st = lr20xx_system_set_standby_mode(&r, LR20XX_SYSTEM_STANDBY_MODE_XOSC);
+                ok = (st == LR20XX_STATUS_OK);
+            }
+            if (ok) {
+                const lr20xx_status_t st =
+                    lr20xx_radio_common_set_tx_test_mode(&r, LR20XX_RADIO_COMMON_TX_TEST_MODE_CONTINUOUS_WAVE);
+                ok = (st == LR20XX_STATUS_OK);
             }
             if (ok) {
                 // fskInit() stamps r.mode = FSK; override so run()/dataIn's
@@ -311,38 +324,74 @@ bool LR2021Manager ::setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 po
 }
 
 bool LR2021Manager ::txCw(FwIndexType idx, U32 freq_hz, I8 power_dbm) {
+    // Thin wrapper: all the actual CW keying (band/PA setup via fskInit,
+    // STANDBY_XOSC, then set_tx_test_mode) lives in setMode()'s RadioMode::CW
+    // case, so there is exactly one path that can key a carrier and exactly
+    // one that stamps r.mode = CW.
+    return this->setMode(idx, RadioMode::CW, freq_hz, power_dbm);
+}
+
+bool LR2021Manager ::txTest(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 power_dbm, U32 duration_s) {
     FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
+    if ((mode != RadioMode::FSK) && (mode != RadioMode::FLRC)) {
+        return false;
+    }
     RadioSlot& r = this->m_radio[idx];
 
-    // Bench test: key an unmodulated carrier at freq_hz / power_dbm. The band
-    // RX/PA path was selected once in setMode (radioInit + fskInit/flrcInit),
-    // so keep freq_hz in that radio's band. Enters STANDBY_XOSC (TCXO running),
-    // (re)programs power and frequency, then the continuous-wave test mode.
-    lr20xx_status_t status = lr20xx_system_set_standby_mode(&r, LR20XX_SYSTEM_STANDBY_MODE_XOSC);
-    if (status != LR20XX_STATUS_OK) {
-        DEBUG("CW set_standby failed (%d)", status);
+    // A test switch aborts any in-flight TX, same as setMode().
+    if (r.txInFlight && r.workingBuffer.isValid()) {
+        this->txComplete(r, Fw::Success::FAILURE);
+    }
+    r.txInFlight = false;
+
+    // Band/PA-path, frequency and TX power via the requested packet engine's
+    // own init (packet/modulation params are irrelevant to a raw PRBS9
+    // pattern, but the init also selects the right RX/PA path for the band).
+    bool ok = (mode == RadioMode::FLRC) ? this->flrcInit(r, freq_hz, power_dbm)
+                                        : this->fskInit(r, freq_hz, power_dbm);
+    if (ok) {
+        // fskInit/flrcInit leave the chip in STANDBY_RC (TCXO off); enter
+        // STANDBY_XOSC so the HF clock runs, or the test carrier never
+        // radiates (same requirement as the CW case in setMode()).
+        const lr20xx_status_t st = lr20xx_system_set_standby_mode(&r, LR20XX_SYSTEM_STANDBY_MODE_XOSC);
+        ok = (st == LR20XX_STATUS_OK);
+    }
+    if (ok) {
+        // set_tx_test_mode() itself keys the modulated carrier (same as
+        // set_tx_cw for the CW mode); it must NOT be followed by set_tx(),
+        // which would cancel the test pattern (verified on HW).
+        const lr20xx_status_t st =
+            lr20xx_radio_common_set_tx_test_mode(&r, LR20XX_RADIO_COMMON_TX_TEST_MODE_PRBS9);
+        ok = (st == LR20XX_STATUS_OK);
+    }
+    if (!ok) {
+        DEBUG("radio %d TX test failed to key", static_cast<int>(idx));
+        // Best-effort: still try to bring the radio back to a known-good
+        // (RX) state rather than leaving it in whatever partial state the
+        // failed sequence left it in.
+        (void)this->setMode(idx, mode, freq_hz, power_dbm);
         return false;
     }
-    // set_tx_params takes 0.5 dBm steps.
-    status = lr20xx_radio_common_set_tx_params(&r, static_cast<int8_t>(power_dbm * 2),
-                                               LR20XX_RADIO_COMMON_RAMP_96_US);
-    if (status != LR20XX_STATUS_OK) {
-        DEBUG("CW set_tx_params failed (%d)", status);
-        return false;
-    }
-    status = lr20xx_radio_common_set_rf_freq(&r, freq_hz);
-    if (status != LR20XX_STATUS_OK) {
-        DEBUG("CW set_rf_freq failed (%d)", status);
-        return false;
-    }
-    r.progFreqHz = freq_hz;
-    status = lr20xx_radio_common_set_tx_test_mode(&r, LR20XX_RADIO_COMMON_TX_TEST_MODE_CONTINUOUS_WAVE);
-    if (status != LR20XX_STATUS_OK) {
-        DEBUG("CW set_tx_test_mode failed (%d)", status);
-        return false;
-    }
-    r.txInFlight = true;  // carrier is up; services stay IRQ-driven no-ops
-    DEBUG("radio %d CW on: %u Hz, %d dBm", static_cast<int>(idx), freq_hz, static_cast<int>(power_dbm));
+
+    DEBUG("radio %d PRBS9 TX test: %u Hz, %d dBm, %u s", static_cast<int>(idx),
+          static_cast<unsigned>(freq_hz), static_cast<int>(power_dbm), static_cast<unsigned>(duration_s));
+
+    // Test mode has no hardware timeout, and we must NOT block the thread to
+    // time it (that stalls the message queue -> async dataIn frames pile up
+    // -> queue-full assert -> FATAL). Instead schedule a non-blocking stop:
+    // record the deadline and the mode/freq/power to restore, and let run()
+    // stop the carrier (via setMode) once the deadline passes. Park r.mode at
+    // NONE meanwhile so run()'s service switch and dataIn's TX switch both
+    // no-op/drop for this slot while the carrier is up (the other radio keeps
+    // running normally).
+    r.txTesting = true;
+    r.txTestMode = mode;
+    r.txTestFreqHz = freq_hz;
+    r.txTestPowerDbm = power_dbm;
+    Fw::Time end = this->getTime();
+    end.add(duration_s, 0);
+    r.txTestEnd = end;
+    r.mode = RadioMode::NONE;
     return true;
 }
 
@@ -354,6 +403,23 @@ void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
     // Poll radio IRQs (TX done / RX done / errors) on every radio.
     for (FwIndexType i = 0; i < NUM_RADIOS; i++) {
         RadioSlot& r = this->m_radio[i];
+
+        // Non-blocking timed TX test: while a test carrier is up on this slot
+        // (r.mode parked at NONE), stop servicing it and just watch the clock.
+        // When the deadline passes, restore normal continuous RX (setMode also
+        // clears r.txTesting), which stops the carrier.
+        if (r.txTesting) {
+            if (this->getTime() >= r.txTestEnd) {
+                const bool ok = this->setMode(i, r.txTestMode, r.txTestFreqHz, r.txTestPowerDbm);
+                if (ok) {
+                    this->log_ACTIVITY_HI_TxTestDone(static_cast<U8>(i));
+                } else {
+                    this->log_WARNING_HI_TxTestError(static_cast<U8>(i));
+                }
+            }
+            continue;
+        }
+
         switch (r.mode) {
             case RadioMode::FLRC:
                 this->flrcService(r);
@@ -742,6 +808,47 @@ void LR2021Manager ::RadioTxRoute_cmdHandler(FwOpcodeType opCode,
     this->setTxRoute(queueIndex, target);
     this->log_ACTIVITY_HI_RouteSet(source, target);
     this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
+}
+
+void LR2021Manager ::RadioTxTest_cmdHandler(FwOpcodeType opCode,
+                                            U32 cmdSeq,
+                                            U8 radio,
+                                            LR2021Manager_Mode mode,
+                                            U32 freq_hz,
+                                            I8 power_dbm,
+                                            U32 duration_s) {
+    if (radio >= NUM_RADIOS) {
+        this->log_WARNING_LO_BadRadioIndex(radio);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    RadioMode target = RadioMode::NONE;
+    switch (mode.e) {
+        case LR2021Manager_Mode::FLRC:
+            target = RadioMode::FLRC;
+            break;
+        case LR2021Manager_Mode::FSK:
+            target = RadioMode::FSK;
+            break;
+        default:
+            break;
+    }
+    if (target == RadioMode::NONE) {
+        // CW (unmodulated) is not a valid packet engine for a PRBS9 test.
+        this->log_WARNING_HI_TxTestError(radio);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    // Non-blocking: txTest() keys the test carrier and schedules its own stop
+    // in run() at the deadline (blocking here would overflow the async message
+    // queue -> queue-full FATAL). The command returns as soon as the carrier
+    // is keyed; TxTestDone is emitted later by run() when RX is restored.
+    this->log_ACTIVITY_HI_TxTestStarted(radio, mode, duration_s);
+    const bool ok = this->txTest(radio, target, freq_hz, power_dbm, duration_s);
+    if (!ok) {
+        this->log_WARNING_HI_TxTestError(radio);
+    }
+    this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
 }
 
 }  // namespace LR2021
