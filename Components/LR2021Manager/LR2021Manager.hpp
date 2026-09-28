@@ -190,6 +190,7 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Manually set the TX RF frequency of radio \p idx, in Hz. 0 (default)
     //! means "use the frequency passed to setMode". Keep it in the same band
     //! as setMode's frequency (the PA / RX path is selected once at init).
+    //! Honored by both FSK and FLRC (retune before TX, back for RX).
     void setTxFreq(FwIndexType idx, U32 tx_freq_hz);
 
     //! Manually set the RX (rest) RF frequency of radio \p idx, in Hz.
@@ -529,11 +530,14 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! FAILURE closes the com flow until the next successful setMode().
     void txComplete(RadioSlot& r, Fw::Success status);
 
-    //! Forward a received packet of \p len bytes to the configured RX sink
-    //! (dataOut in flight, or the byte-stream/UART driver on a ground relay).
-    //! Allocates a buffer from the buffer manager and always returns it. Does
-    //! nothing when \p data is nullptr or \p len is 0.
-    void forwardRxPacket(const U8* data, U16 len);
+    //! Forward a packet of \p len bytes received by radio \p idx to the
+    //! configured RX sink (dataOut in flight, or the byte-stream/UART driver
+    //! on a ground relay). On dataOut the frame context's comQueueIndex
+    //! carries the receiving radio index (nothing on the uplink path reads
+    //! that field; a multi-radio ground modem uses it to tell the bands
+    //! apart). Allocates a buffer from the buffer manager and always returns
+    //! it. Does nothing when \p data is nullptr or \p len is 0.
+    void forwardRxPacket(FwIndexType idx, const U8* data, U16 len);
 
     //! Ground uplink relay: transmit the bytes in \p data over the radio.
     //! Full route to radio 0 for now (TODO: route by CCSDS APID). The radio

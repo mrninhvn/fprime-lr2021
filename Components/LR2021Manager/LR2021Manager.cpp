@@ -191,7 +191,7 @@ void LR2021Manager ::setRxSink(RxSink sink) {
     this->m_rxSink = sink;
 }
 
-void LR2021Manager ::forwardRxPacket(const U8* data, U16 len) {
+void LR2021Manager ::forwardRxPacket(FwIndexType idx, const U8* data, U16 len) {
     if ((data == nullptr) || (len == 0)) {
         return;
     }
@@ -220,8 +220,9 @@ void LR2021Manager ::forwardRxPacket(const U8* data, U16 len) {
         // accumulator). Ownership passes downstream and comes back on
         // dataReturnIn. If unconnected, free it here so it is not leaked.
         if (this->isConnected_dataOut_OutputPort(0)) {
-            ComCfg::FrameContext emptyContext;
-            this->dataOut_out(0, recv_buffer, emptyContext);
+            ComCfg::FrameContext rxContext;
+            rxContext.set_comQueueIndex(idx);  // receiving radio
+            this->dataOut_out(0, recv_buffer, rxContext);
         } else {
             this->deallocate_out(0, recv_buffer);
         }

@@ -74,12 +74,16 @@ bool LR2021Manager ::flrcInit(RadioSlot& r, U32 freq_hz, I8 power_dbm) {
         return false;
     }
 
-    status = lr20xx_radio_common_set_rf_freq(&r, freq_hz);
+    // Base frequency for this mode; RX rests on the RX channel and TX may
+    // retune to a separate one (setRxFreq / setTxFreq), as in fskInit.
+    r.freqHz = freq_hz;
+    const U32 rx_freq = r.rxFreqHz ? r.rxFreqHz : r.freqHz;
+    status = lr20xx_radio_common_set_rf_freq(&r, rx_freq);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_rf_freq failed (%d)", status);
         return false;
     }
-    r.progFreqHz = freq_hz;
+    r.progFreqHz = rx_freq;
 
     // Select the RX path and PA matching the requested band:
     // sub-GHz -> LF path/PA, 2.4 GHz -> HF path/PA.
@@ -179,6 +183,22 @@ bool LR2021Manager ::flrcTx(RadioSlot& r, const U8* data, U16 len) {
         return false;
     }
 
+    // Split TX/RX plan: retune to the TX channel. The chip sits in continuous
+    // RX here, so enter STDBY_XOSC first (SetRfFrequency is a standby command;
+    // XOSC keeps a TCXO running). No-op when TX shares the RX frequency.
+    // fskTune is mode-independent (cached SetRfFrequency).
+    const U32 tx_freq = r.txFreqHz ? r.txFreqHz : r.freqHz;
+    if (tx_freq != r.progFreqHz) {
+        status = lr20xx_system_set_standby_mode(&r, LR20XX_SYSTEM_STANDBY_MODE_XOSC);
+        if (status != LR20XX_STATUS_OK) {
+            DEBUG("TX set_standby failed (%d)", status);
+            return false;
+        }
+        if (!this->fskTune(r, tx_freq)) {
+            return false;
+        }
+    }
+
     status = lr20xx_radio_common_set_tx(&r, FLRC_TX_TIMEOUT_MS);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_tx failed (%d)", status);
@@ -215,6 +235,14 @@ bool LR2021Manager ::flrcRx(RadioSlot& r, U32 timeout_ms) {
     status = lr20xx_radio_fifo_clear_rx(&r);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("fifo_clear_rx failed (%d)", status);
+        return false;
+    }
+
+    // Back to the RX (rest) channel. The chip is in standby here (TX_DONE
+    // falls back to STDBY_XOSC; flrcInit leaves STDBY_RC). No-op when the
+    // TX and RX frequencies are the same.
+    const U32 rx_freq = r.rxFreqHz ? r.rxFreqHz : r.freqHz;
+    if (!this->fskTune(r, rx_freq)) {
         return false;
     }
 
@@ -290,7 +318,7 @@ void LR2021Manager ::flrcService(RadioSlot& r) {
             this->logHex("FLRC RX", payload, (pkt_len > 32) ? 32 : pkt_len);
             // Forward to the configured RX sink: dataOut (frame accumulator) in
             // flight, or straight out the UART driver on a ground relay.
-            this->forwardRxPacket(payload, pkt_len);
+            this->forwardRxPacket(r.idx, payload, pkt_len);
         }
 
         this->m_rxCount++;

@@ -595,7 +595,7 @@ void LR2021Manager ::fskService(RadioSlot& r) {
             this->logHex("FSK RX", out_data, (out_len > 32) ? 32 : out_len);
             // Forward to the configured RX sink: dataOut (frame accumulator) in
             // flight, or straight out the UART driver on a ground relay.
-            this->forwardRxPacket(out_data, out_len);
+            this->forwardRxPacket(r.idx, out_data, out_len);
         }
 
         this->m_fskRxCount++;
