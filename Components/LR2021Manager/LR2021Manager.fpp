@@ -192,6 +192,9 @@ module LR2021 {
         @ is the true channel BER. Both radios are (re)configured to the same
         @ mode / freq / power on their own dedicated BER syncword, so they must
         @ be on the same band and coupled (coax + attenuator on the bench).
+        @ Per-radio TX/RX frequency overrides are suspended for the test so both
+        @ sit exactly on freq_hz; each radio's previous mode / freq / power /
+        @ overrides are restored when the test ends.
         @ mode must be FSK or FLRC (CW is rejected). Non-blocking: the command
         @ returns once the test is armed (BerTestStarted); run() paces the TX,
         @ tallies RX, and emits BerTestDone with the result when it finishes.
@@ -262,10 +265,11 @@ module LR2021 {
             format "BER test started: radio {} -> {} ({}), {} packets"
 
         @ RadioBerTest finished: reports the measured bit error rate
-        event BerTestDone(tx_radio: U8, rx_radio: U8, sent: U32, received: U32, \
-                          lost: U32, bit_errors: U32, total_bits: U32, ber_ppm: U32) \
+        event BerTestDone(tx_radio: U8, rx_radio: U8, freq_hz: U32, bitrate_bps: U32, \
+                          sent: U32, received: U32, lost: U32, bit_errors: U32, \
+                          total_bits: U32, ber_ppm: U32) \
             severity activity high \
-            format "BER test done: radio {} -> {}, sent {}, rx {}, lost {}, bit errors {}/{}, BER {} ppm"
+            format "BER test done: radio {} -> {}, {} Hz, {} bps, sent {}, rx {}, lost {}, bit errors {}/{}, BER {} ppm"
 
         @ RadioBerTest given a bad mode / radio pair, or a radio operation
         @ failed while arming or running the test

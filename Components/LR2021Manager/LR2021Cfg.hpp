@@ -53,6 +53,23 @@ extern "C" {
 #define FLRC_CRC LR20XX_RADIO_FLRC_CRC_OFF
 #endif
 
+// Raw over-the-air bit rate (bps) for the selected FLRC_RAW_BIT_RATE, used to
+// report the link speed (e.g. in BER test results). Kept in sync with the
+// br_bw enum here so it tracks any change to FLRC_RAW_BIT_RATE at compile time.
+// Single return statement (C++11 constexpr): a ternary chain over the enum.
+constexpr uint32_t flrcRawBitrateBps(lr20xx_radio_flrc_br_bw_t br_bw) {
+    return (br_bw == LR20XX_RADIO_FLRC_BR_2_600_BW_2_666)   ? 2600000u
+           : (br_bw == LR20XX_RADIO_FLRC_BR_2_080_BW_2_222) ? 2080000u
+           : (br_bw == LR20XX_RADIO_FLRC_BR_1_300_BW_1_333) ? 1300000u
+           : (br_bw == LR20XX_RADIO_FLRC_BR_1_040_BW_1_333) ? 1040000u
+           : (br_bw == LR20XX_RADIO_FLRC_BR_0_650_BW_0_740) ? 650000u
+           : (br_bw == LR20XX_RADIO_FLRC_BR_0_520_BW_0_571) ? 520000u
+           : (br_bw == LR20XX_RADIO_FLRC_BR_0_325_BW_0_357) ? 325000u
+           : (br_bw == LR20XX_RADIO_FLRC_BR_0_260_BW_0_307) ? 260000u
+                                                            : 0u;
+}
+constexpr uint32_t FLRC_RAW_BITRATE_BPS = flrcRawBitrateBps(FLRC_RAW_BIT_RATE);
+
 // Syncword #1, used for both TX and RX matching.
 constexpr uint8_t FLRC_SYNCWORD[LR20XX_RADIO_FLRC_SYNCWORD_LENGTH] = { 0x90, 0x56, 0x34, 0x12 };
 

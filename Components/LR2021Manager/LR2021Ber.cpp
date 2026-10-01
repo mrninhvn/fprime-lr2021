@@ -17,6 +17,7 @@
 
 extern "C" {
 #include "lr20xx_radio_fifo.h"
+#include "lr20xx_system.h"
 }
 
 namespace LR2021 {
@@ -53,29 +54,43 @@ bool LR2021Manager ::berStart(FwIndexType txRadio,
         return false;
     }
 
-    // Bring both radios up in the requested mode / band. setMode() leaves each
-    // in normal continuous RX (role-based for FSK, raw for FLRC).
-    if (!this->setMode(txRadio, mode, freq_hz, power_dbm)) {
-        return false;
-    }
-    if (!this->setMode(rxRadio, mode, freq_hz, power_dbm)) {
-        return false;
+    // Snapshot both radios so berRestore() can put them back exactly, then
+    // clear their per-slot TX/RX frequency overrides: those take precedence
+    // over setMode()'s frequency, and a split plan (e.g. RY42F TX 2250 / RX
+    // 2270 MHz) would put the two radios on different channels.
+    this->m_ber.txRadio = txRadio;
+    this->m_ber.rxRadio = rxRadio;
+    const FwIndexType radios[2] = {txRadio, rxRadio};
+    for (FwIndexType i = 0; i < 2; i++) {
+        RadioSlot& r = this->m_radio[radios[i]];
+        BerSavedRadio& s = this->m_ber.saved[i];
+        s.mode = r.mode;
+        s.freqHz = r.freqHz;
+        s.powerDbm = r.powerDbm;
+        s.txFreqHz = r.txFreqHz;
+        s.rxFreqHz = r.rxFreqHz;
+        r.txFreqHz = 0;
+        r.rxFreqHz = 0;
     }
 
-    // FLRC RX is already a raw byte pipe; the FSK RX must be switched off the
-    // CCSDS role channel onto the dedicated raw BER syncword / fixed length.
-    if (mode == RadioMode::FSK) {
-        if (!this->fskBerRx(this->m_radio[rxRadio], payload_len)) {
-            return false;
-        }
+    // Bring both radios up in the requested mode / band. setMode() leaves each
+    // in normal continuous RX (role-based for FSK, raw for FLRC). FLRC RX is
+    // already a raw byte pipe; the FSK RX must be switched off the CCSDS role
+    // channel onto the dedicated raw BER syncword / fixed length.
+    bool ok = this->setMode(txRadio, mode, freq_hz, power_dbm) &&
+              this->setMode(rxRadio, mode, freq_hz, power_dbm);
+    if (ok && (mode == RadioMode::FSK)) {
+        ok = this->fskBerRx(this->m_radio[rxRadio], payload_len);
+    }
+    if (!ok) {
+        this->berRestore();
+        return false;
     }
 
     this->berFillPattern(this->m_ber.pattern, payload_len);
 
     this->m_ber.active = true;
     this->m_ber.phase = BerPhase::SENDING;
-    this->m_ber.txRadio = txRadio;
-    this->m_ber.rxRadio = rxRadio;
     this->m_ber.mode = mode;
     this->m_ber.freqHz = freq_hz;
     this->m_ber.powerDbm = power_dbm;
@@ -185,6 +200,11 @@ void LR2021Manager ::berFinish() {
         berPpm = static_cast<U32>((static_cast<U64>(bitErrors) * 1000000ULL) / totalBits);
     }
 
+    // Nominal over-the-air bit rate of the mode under test, for context.
+    const U32 bitrateBps = (this->m_ber.mode == RadioMode::FSK)
+                               ? static_cast<U32>(FSK_BITRATE_BPS)
+                               : FLRC_RAW_BITRATE_BPS;
+
     this->m_ber.active = false;
 
     this->tlmWrite_BerBitErrors(bitErrors);
@@ -193,14 +213,30 @@ void LR2021Manager ::berFinish() {
     this->tlmWrite_BerPacketsRecv(recv);
     this->tlmWrite_BerPacketsLost(lost);
     this->log_ACTIVITY_HI_BerTestDone(static_cast<U8>(this->m_ber.txRadio),
-                                      static_cast<U8>(this->m_ber.rxRadio), sent, recv, lost,
-                                      bitErrors, totalBits, berPpm);
+                                      static_cast<U8>(this->m_ber.rxRadio), this->m_ber.freqHz,
+                                      bitrateBps, sent, recv, lost, bitErrors, totalBits, berPpm);
 
-    // Restore both radios to normal continuous RX in their mode (the RX radio
-    // was parked on the raw BER channel; the TX radio is already back in RX
-    // after its last TX_DONE, but setMode gives a clean, known state).
-    (void)this->setMode(this->m_ber.rxRadio, this->m_ber.mode, this->m_ber.freqHz, this->m_ber.powerDbm);
-    (void)this->setMode(this->m_ber.txRadio, this->m_ber.mode, this->m_ber.freqHz, this->m_ber.powerDbm);
+    this->berRestore();
+}
+
+void LR2021Manager ::berRestore() {
+    const FwIndexType radios[2] = {this->m_ber.txRadio, this->m_ber.rxRadio};
+    for (FwIndexType i = 0; i < 2; i++) {
+        const FwIndexType idx = radios[i];
+        RadioSlot& r = this->m_radio[idx];
+        const BerSavedRadio& s = this->m_ber.saved[i];
+        // Overrides first: setMode() programs the chip from them.
+        r.txFreqHz = s.txFreqHz;
+        r.rxFreqHz = s.rxFreqHz;
+        if (s.mode != RadioMode::NONE) {
+            (void)this->setMode(idx, s.mode, s.freqHz, s.powerDbm);
+        } else {
+            // Radio had no active mode before the test: leave it unconfigured.
+            (void)lr20xx_system_set_standby_mode(&r, LR20XX_SYSTEM_STANDBY_MODE_RC);
+            r.mode = RadioMode::NONE;
+            r.txInFlight = false;
+        }
+    }
 }
 
 }  // namespace LR2021

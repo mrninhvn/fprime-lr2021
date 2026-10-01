@@ -315,8 +315,13 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     void berDrive();
 
     //! Finalize the running BER test: emit BerTestDone + telemetry and restore
-    //! both radios to normal continuous RX in their mode.
+    //! both radios to their pre-test configuration (berRestore).
     void berFinish();
+
+    //! Put both BER radios back exactly as berStart() found them: TX/RX
+    //! frequency overrides, then mode / freq / power (a radio that had no
+    //! active mode is parked in standby).
+    void berRestore();
 
     //! Transmit one BER test packet (the stored pattern) from slot \p r,
     //! dispatching to the FSK / FLRC raw TX. \return true on success
@@ -555,9 +560,19 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
         DRAINING   //!< All sent; waiting for the last packets to arrive
     };
 
+    //! Pre-test configuration of one radio, restored when the BER test ends.
+    struct BerSavedRadio {
+        RadioMode mode = RadioMode::NONE;
+        U32 freqHz = 0;
+        I8 powerDbm = 0;
+        U32 txFreqHz = 0;  //!< TX frequency override (cleared during the test)
+        U32 rxFreqHz = 0;  //!< RX frequency override (cleared during the test)
+    };
+
     //! Non-blocking BER test. active gates run()'s send/tally loop and the
     //! RX-service interception; every field is set by berStart().
     struct BerTest {
+        BerSavedRadio saved[2];  //!< [0] = TX radio, [1] = RX radio, before the test
         bool active = false;
         BerPhase phase = BerPhase::SENDING;
         FwIndexType txRadio = 0;
