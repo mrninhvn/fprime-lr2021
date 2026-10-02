@@ -238,11 +238,19 @@ FwIndexType LR2021Manager ::routeTx(const ComCfg::FrameContext& context) const {
 }
 
 void LR2021Manager ::txComplete(RadioSlot& r, Fw::Success status) {
+    r.txHeld = false;
+    r.txAttempts = 0;
     if (r.workingBuffer.isValid()) {
         Fw::Buffer buffer = r.workingBuffer;
         ComCfg::FrameContext context = r.workingContext;
         r.workingBuffer = Fw::Buffer();
         r.workingContext = ComCfg::FrameContext();
+        if (r.relayFrame) {
+            // Relay frames are outside the com flow: just free the buffer.
+            r.relayFrame = false;
+            this->deallocate_out(0, buffer);
+            return;
+        }
         if (this->isConnected_dataReturnOut_OutputPort(0)) {
             this->dataReturnOut_out(0, buffer, context);
         }
@@ -259,14 +267,19 @@ bool LR2021Manager ::setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 po
     FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
     RadioSlot& r = this->m_radio[idx];
 
-    // A mode switch aborts any in-flight TX: drop the frame, returning its
-    // buffer (if it owns one) to the framer. It also cancels any pending
-    // timed TX test on this slot (setMode is how run() restores RX after a
-    // test, and an explicit command should override a running test too).
-    if (r.txInFlight && r.workingBuffer.isValid()) {
+    // A mode switch aborts any in-flight or LBT-held TX: drop the frame,
+    // returning its buffer to the framer (or freeing a relay frame). It also
+    // cancels any pending timed TX test on this slot (setMode is how run()
+    // restores RX after a test, and an explicit command should override a
+    // running test too).
+    if (r.workingBuffer.isValid()) {
         this->txComplete(r, Fw::Success::FAILURE);
     }
     r.txInFlight = false;
+    r.txHeld = false;
+    r.cadListening = false;
+    r.peerBusyUntil = Fw::Time();
+    r.txQuietUntil = Fw::Time();
     r.txTesting = false;
 
     bool ok = false;
@@ -312,6 +325,10 @@ bool LR2021Manager ::setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 po
     if (ok) {
         r.freqHz = freq_hz;
         r.powerDbm = power_dbm;
+        // Each mode has its own LBT defaults unless set by command/topology.
+        if (!r.lbtCustom) {
+            r.lbt = lbtDefaults(mode);
+        }
         // Open (or re-open after a failure) the downlink flow. Emitted only
         // once: the framer stack must see a single initial comStatus, each
         // further one is granted per completed TX in txComplete().
@@ -339,11 +356,13 @@ bool LR2021Manager ::txTest(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 pow
     }
     RadioSlot& r = this->m_radio[idx];
 
-    // A test switch aborts any in-flight TX, same as setMode().
-    if (r.txInFlight && r.workingBuffer.isValid()) {
+    // A test switch aborts any in-flight or held TX, same as setMode().
+    if (r.workingBuffer.isValid()) {
         this->txComplete(r, Fw::Success::FAILURE);
     }
     r.txInFlight = false;
+    r.txHeld = false;
+    r.cadListening = false;
 
     // Band/PA-path, frequency and TX power via the requested packet engine's
     // own init (packet/modulation params are irrelevant to a raw PRBS9
@@ -431,6 +450,11 @@ void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
             default:
                 break;
         }
+
+        // After the service poll (so a just-received packet is read and the
+        // peer-activity flags are current): retry LBT-held frames, sample
+        // the idle-channel noise floor.
+        this->lbtRun(r);
     }
 
     // Drive the non-blocking BER test (if one is running): the per-slot
@@ -570,24 +594,20 @@ void LR2021Manager ::dataIn_handler(FwIndexType portNum,
     RadioSlot& r = this->m_radio[idx];
 
     // The framer stack sends one frame per comStatus credit, so the routed
-    // radio is normally idle here; any local failure drops the frame.
+    // radio is normally idle here; any local failure drops the frame. A busy
+    // channel is not a failure: txSend() holds the frame for a backoff and
+    // the next credit is granted only once it is on the air.
     bool ok = false;
-    if (data.isValid() && (data.getSize() > 0) && !r.txInFlight) {
+    if (data.isValid() && (data.getSize() > 0) && !r.workingBuffer.isValid() && !r.txInFlight) {
         r.workingBuffer = data;
         r.workingContext = context;
-        switch (r.mode) {
-            case RadioMode::FLRC:
-                ok = this->flrcTx(r, r.workingBuffer.getData(), r.workingBuffer.getSize());
-                break;
-            case RadioMode::FSK:
-                ok = this->fskTx(r, r.workingBuffer.getData(), r.workingBuffer.getSize());
-                break;
-            default:
-                break;
-        }
+        r.relayFrame = false;
+        r.txAttempts = 0;
+        ok = this->txSend(r);
         if (!ok) {
             r.workingBuffer = Fw::Buffer();
             r.workingContext = ComCfg::FrameContext();
+            r.txHeld = false;
         }
     }
     if (!ok) {
@@ -636,11 +656,9 @@ void LR2021Manager ::drvReceiveIn_handler(FwIndexType portNum,
 
 void LR2021Manager ::relayIn_handler(FwIndexType portNum, Fw::Buffer& data, const ComCfg::FrameContext& context) {
     // A complete frame routed to the radio by the APID router: transmit it
-    // verbatim (fire-and-forget) and free the buffer. flrcTx/fskTx copy the
-    // payload into the radio FIFO synchronously, so the buffer can be returned
-    // to the (shared) buffer manager immediately.
+    // verbatim (fire-and-forget). relayUplink owns the buffer from here: LBT
+    // may hold the frame, so it is freed only once sent or dropped.
     this->relayUplink(data);
-    this->deallocate_out(0, data);
 }
 
 void LR2021Manager ::relayUplink(Fw::Buffer& data) {
@@ -654,35 +672,35 @@ void LR2021Manager ::relayUplink(Fw::Buffer& data) {
     // Drop the relay while a BER test owns this radio (it is mid raw test TX/RX).
     if (this->m_ber.active && ((idx == this->m_ber.txRadio) || (idx == this->m_ber.rxRadio))) {
         DEBUG("radio %d uplink relay dropped (BER test active)", static_cast<int>(idx));
+        this->deallocate_out(0, data);
         return;
     }
 
-    // No working buffer / comStatus crediting for a relay: flrcTx/fskTx copy
-    // the payload into the radio FIFO synchronously, so the source buffer is
-    // freed by the caller right after. TX_DONE in the service loop then finds
-    // an empty working buffer and returns the radio to RX.
+    // The relay frame becomes the slot's working frame (flagged relayFrame:
+    // no dataReturnOut / comStatus credit) so LBT can hold it; txComplete()
+    // frees it once it is sent or dropped.
     const U16 len = data.isValid() ? static_cast<U16>(data.getSize()) : 0;
     bool ok = false;
-    if ((len > 0) && !r.txInFlight) {
-        switch (r.mode) {
-            case RadioMode::FLRC:
-                ok = this->flrcTx(r, data.getData(), len);
-                break;
-            case RadioMode::FSK:
-                ok = this->fskTx(r, data.getData(), len);
-                break;
-            default:
-                break;
+    if ((len > 0) && !r.workingBuffer.isValid() && !r.txInFlight) {
+        r.workingBuffer = data;
+        r.workingContext = ComCfg::FrameContext();
+        r.relayFrame = true;
+        r.txAttempts = 0;
+        ok = this->txSend(r);
+        if (!ok) {
+            r.workingBuffer = Fw::Buffer();
+            r.relayFrame = false;
+            r.txHeld = false;
         }
     }
     if (ok) {
-        // The relay path does not use the working buffer, so flrcService's
-        // "TX done" prints 0 bytes; log the actual relayed size here instead.
-        DEBUG("radio %d relay TX %u bytes", static_cast<int>(idx), static_cast<unsigned>(len));
+        DEBUG("radio %d relay TX %u bytes%s", static_cast<int>(idx), static_cast<unsigned>(len),
+              r.txHeld ? " (held: channel busy)" : "");
     } else {
-        DEBUG("radio %d uplink relay dropped (%u bytes, txInFlight=%d)", static_cast<int>(idx),
-              static_cast<unsigned>(len), static_cast<int>(r.txInFlight));
+        DEBUG("radio %d uplink relay dropped (%u bytes, slot busy=%d)", static_cast<int>(idx),
+              static_cast<unsigned>(len), static_cast<int>(r.workingBuffer.isValid() || r.txInFlight));
         this->log_WARNING_HI_TxFrameDropped(static_cast<U8>(idx));
+        this->deallocate_out(0, data);
     }
 }
 

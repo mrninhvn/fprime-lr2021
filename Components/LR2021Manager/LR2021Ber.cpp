@@ -108,8 +108,9 @@ bool LR2021Manager ::berStart(FwIndexType txRadio,
 bool LR2021Manager ::berTxOne(RadioSlot& r) {
     switch (this->m_ber.mode) {
         case RadioMode::FLRC:
-            // FLRC TX is already raw (payload sent verbatim).
-            return this->flrcTx(r, this->m_ber.pattern, this->m_ber.payloadLen);
+            // FLRC TX is already raw (payload sent verbatim). No LBT: the
+            // test measures the channel, it does not share it.
+            return this->flrcTx(r, this->m_ber.pattern, this->m_ber.payloadLen, false);
         case RadioMode::FSK:
             return this->fskBerTx(r, this->m_ber.pattern, this->m_ber.payloadLen);
         default:
@@ -235,6 +236,7 @@ void LR2021Manager ::berRestore() {
             (void)lr20xx_system_set_standby_mode(&r, LR20XX_SYSTEM_STANDBY_MODE_RC);
             r.mode = RadioMode::NONE;
             r.txInFlight = false;
+            r.cadListening = false;
         }
     }
 }

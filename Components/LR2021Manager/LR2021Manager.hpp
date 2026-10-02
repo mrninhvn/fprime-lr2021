@@ -93,6 +93,19 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! (CCSDS 231.0-B); ground is the mirror image.
     enum class CcsdsRole { SPACECRAFT, GROUND };
 
+    //! Listen-before-talk configuration of one radio (see the LBT section of
+    //! LR2021Cfg.hpp). Link-aware carrier sense is always on; this selects the
+    //! hardware CAD-LBT energy gate and the retry policy.
+    struct LbtCfg {
+        bool cadEnabled = false;  //!< Gate TX on the LR2021 RSSI CAD (exit mode TX)
+        I16 thresholdDbm = -100;  //!< CAD busy threshold, dBm
+        U32 listenUs = 5000;      //!< CAD listen window, us
+        U16 backoffMinMs = 50;    //!< Random backoff range after a busy channel, ms
+        U16 backoffMaxMs = 400;
+        U8 maxAttempts = 8;       //!< Busy results per frame before it is sent anyway
+        U16 turnaroundMs = 200;   //!< Listen-only gap after each own TX, ms (0 = none)
+    };
+
     //! Per-radio state. A pointer to this struct is the lr20xx_driver
     //! context, so it carries the back-pointer needed by the C HAL bridge.
     struct RadioSlot {
@@ -107,9 +120,25 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
         U32 progFreqHz = 0;  //!< RF frequency currently programmed on the chip
         I8 powerDbm = 0;     //!< TX power of the last setMode()
         bool rxContinuous = false;  //!< Re-enter RX automatically after each packet
-        bool txInFlight = false;    //!< TX started, TX_DONE not yet seen
-        Fw::Buffer workingBuffer;   //!< Buffer of the in-flight TX
+        bool txInFlight = false;    //!< TX (or CAD-LBT + TX) started, not yet finished
+        Fw::Buffer workingBuffer;   //!< Frame being sent (in flight or held by LBT)
         ComCfg::FrameContext workingContext;  //!< Frame context of the in-flight TX
+        bool relayFrame = false;    //!< workingBuffer came from relayIn: free it when
+                                    //!< done (no dataReturnOut / comStatus credit)
+
+        // Listen-before-talk (see LR2021Cfg.hpp)
+        LbtCfg lbt;                 //!< Active LBT configuration
+        bool lbtCustom = false;     //!< lbt set by command/topology (setMode keeps it)
+        bool cadListening = false;  //!< CAD-LBT running: CAD_DONE pending
+        bool txHeld = false;        //!< Channel busy: frame waits for txRetryTime
+        Fw::Time txRetryTime;       //!< Earliest retry of the held frame
+        U8 txAttempts = 0;          //!< Busy results seen for the current frame
+        Fw::Time peerBusyUntil;     //!< Link-aware hold: peer frame on the air until then
+        Fw::Time txQuietUntil;      //!< Turnaround: no own TX before then (listen only)
+        I16 noiseMinDbm = 0;        //!< Lowest idle RSSI in the current report window
+        bool noiseValid = false;    //!< noiseMinDbm holds at least one sample
+        Fw::Time noiseNextSample;   //!< Next idle-RSSI sample time
+        Fw::Time noiseNextReport;   //!< End of the current noise report window
 
         // Timed PRBS9 TX test (RadioTxTest command). Non-blocking: the carrier
         // is keyed, then run() stops it and restores RX once the deadline
@@ -208,6 +237,14 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! topology before RX starts.
     void setRxSink(RxSink sink);
 
+    //! Override the listen-before-talk configuration of radio \p idx. Until
+    //! this (or the RadioLbtConfig command) is used, each setMode() loads the
+    //! defaults of the new mode (LBT_FSK_* / LBT_FLRC_* in LR2021Cfg.hpp).
+    void setLbt(FwIndexType idx, const LbtCfg& cfg);
+
+    //! The LR2021Cfg.hpp default LBT configuration of \p mode.
+    static LbtCfg lbtDefaults(RadioMode mode);
+
     //! Initialize the chip of radio \p idx (clocks, DIO/RF-switch map for
     //! its module type, regulator).
     bool radioInit(FwIndexType idx);
@@ -250,9 +287,11 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! \return true on success
     bool flrcInit(RadioSlot& r, U32 freq_hz, I8 power_dbm);
 
-    //! Transmit \p len bytes (padded up to FLRC_MIN_PAYLOAD if shorter)
+    //! Transmit \p len bytes (padded up to FLRC_MIN_PAYLOAD if shorter).
+    //! \p lbt: key through the hardware CAD-LBT gate when the radio has it
+    //! enabled (false for bench traffic and forced sends).
     //! \return true on success
-    bool flrcTx(RadioSlot& r, const U8* data, U16 len);
+    bool flrcTx(RadioSlot& r, const U8* data, U16 len, bool lbt = true);
 
     //! Enter RX mode; timeout_ms == 0 selects continuous RX
     //! \return true on success
@@ -278,9 +317,9 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! \return true on success
     bool fskTune(RadioSlot& r, U32 freq_hz);
 
-    //! Transmit \p len bytes using FSK
+    //! Transmit \p len bytes using FSK. \p lbt as for flrcTx().
     //! \return true on success
-    bool fskTx(RadioSlot& r, const U8* data, U16 len);
+    bool fskTx(RadioSlot& r, const U8* data, U16 len, bool lbt = true);
 
     //! Enter FSK RX mode; timeout_ms == 0 selects continuous RX
     //! \return true on success
@@ -297,6 +336,53 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Enter continuous FSK RX on the BER syncword for fixed-length \p len
     //! packets (raw, no CCSDS coding). \return true on success
     bool fskBerRx(RadioSlot& r, U16 len);
+
+    // ----------------------------------------------------------------------
+    // Listen-before-talk (implemented in LR2021Lbt.cpp)
+    // ----------------------------------------------------------------------
+
+    //! Final step of fskTx/flrcTx, with the FIFO and packet params loaded:
+    //! start the TX directly, or (when \p lbt and the radio's CAD gate is
+    //! enabled) start the RSSI CAD with exit mode TX so the chip keys up only
+    //! if the channel stays clear. \return true on success
+    bool txKey(RadioSlot& r, U32 tx_timeout_ms, bool lbt);
+
+    //! Try to put the slot's working frame on the air: hold it until the
+    //! turnaround window after our last TX ends, defer it (random backoff)
+    //! while a peer frame is arriving, otherwise hand it to fskTx/flrcTx. Once maxAttempts busy results are reached the frame is
+    //! sent with every gate bypassed. \return false on a radio error (the
+    //! caller drops the frame)
+    bool txSend(RadioSlot& r);
+
+    //! Hold the working frame of \p r for a random backoff (channel busy).
+    void lbtDefer(RadioSlot& r);
+
+    //! Open the turnaround window of \p r (listen-only for lbt.turnaroundMs).
+    //! Call after our TX_DONE, once RX is re-armed, so the whole window is
+    //! actually spent listening.
+    void lbtTurnaround(RadioSlot& r);
+
+    //! Link-aware carrier sense: true while a frame of our own link is
+    //! arriving on radio \p r (peer preamble / syncword seen, RX not done).
+    bool lbtPeerBusy(RadioSlot& r);
+
+    //! Track peer activity from an IRQ status read in the service loop:
+    //! PREAMBLE / SYNC detections extend peerBusyUntil, RX_DONE or an RX
+    //! error releases it.
+    void lbtTrackIrq(RadioSlot& r, U32 irq);
+
+    //! Handle CAD_DONE of a CAD-LBT started by txKey(): on CAD_DETECTED the
+    //! TX did not happen, so re-arm RX and defer the frame. Call from the
+    //! service loop. \return true when the channel was busy
+    bool lbtCadDone(RadioSlot& r, U32 irq);
+
+    //! Per-tick LBT work for slot \p r: retry a held frame when its backoff
+    //! ends, and sample the idle-channel RSSI for the noise-floor telemetry.
+    void lbtRun(RadioSlot& r);
+
+    //! Drop the working frame of \p r after a radio error: return/free its
+    //! buffer (FAILURE status for a downlink frame) and log TxFrameDropped.
+    void txDrop(RadioSlot& r);
 
     // ----------------------------------------------------------------------
     // BER test (implemented in LR2021Ber.cpp)
@@ -517,6 +603,29 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
                                  U32 interval_ms           //!< Minimum spacing between packets
                                  ) override;
 
+    //! Handler implementation for command RadioLbtConfig
+    //!
+    //! Set the listen-before-talk configuration of one radio
+    void RadioLbtConfig_cmdHandler(FwOpcodeType opCode,    //!< The opcode
+                                   U32 cmdSeq,             //!< The command sequence number
+                                   U8 radio,               //!< Radio index
+                                   Fw::Enabled cad,        //!< Hardware CAD-LBT energy gate
+                                   I16 threshold_dbm,      //!< CAD busy threshold, dBm
+                                   U32 listen_us,          //!< CAD listen window, us
+                                   U16 backoff_min_ms,     //!< Backoff range lower bound, ms
+                                   U16 backoff_max_ms,     //!< Backoff range upper bound, ms
+                                   U8 max_attempts,        //!< Busy results before a forced send
+                                   U16 turnaround_ms       //!< Listen-only gap after each own TX
+                                   ) override;
+
+    //! Handler implementation for command RadioLbtDefault
+    //!
+    //! Return one radio to the per-mode default LBT configuration
+    void RadioLbtDefault_cmdHandler(FwOpcodeType opCode,  //!< The opcode
+                                    U32 cmdSeq,           //!< The command sequence number
+                                    U8 radio              //!< Radio index
+                                    ) override;
+
   private:
     // ----------------------------------------------------------------------
     // Downlink routing / com status helpers
@@ -530,9 +639,11 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! (route table lookup on comQueueIndex; out-of-table indices -> radio 0).
     FwIndexType routeTx(const ComCfg::FrameContext& context) const;
 
-    //! Finish the in-flight TX of slot \p r: return the working buffer with
-    //! its context on dataReturnOut and emit \p status on comStatusOut.
-    //! FAILURE closes the com flow until the next successful setMode().
+    //! Finish the TX of slot \p r (sent, or aborted while in flight / held by
+    //! LBT): return the working buffer with its context on dataReturnOut and
+    //! emit \p status on comStatusOut; a relay frame is just freed. Clears the
+    //! slot's LBT hold. FAILURE closes the com flow until the next successful
+    //! setMode().
     void txComplete(RadioSlot& r, Fw::Success status);
 
     //! Forward a packet of \p len bytes received by radio \p idx to the
@@ -545,9 +656,10 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     void forwardRxPacket(FwIndexType idx, const U8* data, U16 len);
 
     //! Ground uplink relay: transmit the bytes in \p data over the radio.
-    //! Full route to radio 0 for now (TODO: route by CCSDS APID). The radio
-    //! TX copies the payload into its FIFO synchronously, so the caller keeps
-    //! ownership of \p data and frees it after this returns.
+    //! Full route to radio 0 for now (TODO: route by CCSDS APID). Takes
+    //! ownership of \p data: the slot keeps it as its working frame while LBT
+    //! may hold it, and frees it once the frame is sent or dropped (a frame
+    //! arriving while the radio is busy is dropped).
     void relayUplink(Fw::Buffer& data);
 
     // ----------------------------------------------------------------------
@@ -606,6 +718,9 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     U32 m_fskTxCount = 0;           //!< FSK packets transmitted (all radios)
     U32 m_fskRxCount = 0;           //!< FSK packets received (all radios)
     bool m_adcReady = false;        //!< RF detector ADC channels configured
+    U32 m_lbtBusyCount = 0;         //!< TX deferrals on a busy channel (all radios)
+    U32 m_lbtForcedCount = 0;       //!< Frames sent after maxAttempts busy results
+    U32 m_lbtRng = 0x9E3779B9u;     //!< Backoff PRNG state (xorshift32, never 0)
 };
 
 }  // namespace LR2021

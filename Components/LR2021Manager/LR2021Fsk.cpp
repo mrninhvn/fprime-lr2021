@@ -345,7 +345,7 @@ bool LR2021Manager ::fskInit(RadioSlot& r, U32 freq_hz, I8 power_dbm) {
     return true;
 }
 
-bool LR2021Manager ::fskTx(RadioSlot& r, const U8* data, U16 len) {
+bool LR2021Manager ::fskTx(RadioSlot& r, const U8* data, U16 len, bool lbt) {
     // SPACECRAFT transmits TM frames; GROUND transmits TC frames as CLTUs.
     const bool tx_is_tc = (r.ccsdsRole == CcsdsRole::GROUND);
     const U16 max_data = tx_is_tc ? FSK_CLTU_DATA_CAP : FSK_TM_DATA_CAP;
@@ -407,23 +407,28 @@ bool LR2021Manager ::fskTx(RadioSlot& r, const U8* data, U16 len) {
         return false;
     }
 
-    // Retune to the TX (downlink) channel; no-op when TX shares the RX freq.
+    // Split TX/RX plan: retune to the TX (downlink) channel. The chip sits in
+    // continuous RX here and the LR2021 is configured from standby (datasheet
+    // §Standby: configure before transitioning to another mode), so enter
+    // STDBY_XOSC first, as flrcTx() does. A retune issued from RX could leave
+    // the TX on the RX channel, unseen by the ground. No-op on one frequency.
     const U32 tx_freq = r.txFreqHz ? r.txFreqHz : r.freqHz;
-    if (!this->fskTune(r, tx_freq)) {
-        return false;
+    if (tx_freq != r.progFreqHz) {
+        status = lr20xx_system_set_standby_mode(&r, LR20XX_SYSTEM_STANDBY_MODE_XOSC);
+        if (status != LR20XX_STATUS_OK) {
+            DEBUG("TX set_standby failed (%d)", status);
+            return false;
+        }
+        if (!this->fskTune(r, tx_freq)) {
+            return false;
+        }
     }
 
-    status = lr20xx_radio_common_set_tx(&r, FSK_TX_TIMEOUT_MS);
-    if (status != LR20XX_STATUS_OK) {
-        DEBUG("set_tx failed (%d)", status);
+    // Key up, directly or through the CAD-LBT gate.
+    if (!this->txKey(r, FSK_TX_TIMEOUT_MS, lbt)) {
         return false;
     }
-
-    r.txInFlight = true;
-    DEBUG("radio %d TX started, %u bytes", static_cast<int>(r.idx), len);
-
-    // Sample the antenna coupler RF power detectors while the PA is on.
-    this->rfPowerMeasureTx();
+    DEBUG("radio %d TX started, %u bytes%s", static_cast<int>(r.idx), len, r.cadListening ? " (LBT)" : "");
     return true;
 }
 
@@ -529,21 +534,31 @@ void LR2021Manager ::fskService(RadioSlot& r) {
         return;
     }
 
+    // Link-aware carrier sense: note peer preamble / syncword / RX end.
+    this->lbtTrackIrq(r, irq);
+
+    // CAD-LBT result: a busy channel means the chip never keyed up; listen
+    // again (the peer is probably sending to us) while the frame backs off.
+    if (this->lbtCadDone(r, irq)) {
+        this->fskRx(r, 0);
+        return;
+    }
+
     if ((irq & LR20XX_SYSTEM_IRQ_TX_DONE) != 0) {
         r.txInFlight = false;
         this->m_fskTxCount++;
         this->tlmWrite_FskTxCount(this->m_fskTxCount);
         // this->log_ACTIVITY_HI_FskTxDone(static_cast<U8>(r.idx));
-        // Only the framer/downlink path fills the working buffer; a relay TX
-        // (relayIn) leaves it empty and logs its own size in relayUplink, so
-        // don't print a misleading "0 bytes" here for that case.
+        // BER test packets are sent without a working buffer.
         if (r.workingBuffer.isValid()) {
             DEBUG("radio %d TX done, %llu bytes", static_cast<int>(r.idx), r.workingBuffer.getSize());
         }
-        // Only a TX that owns an F Prime buffer returns one (and grants the
-        // next comStatus credit).
+        // Return the frame's buffer (downlink: plus the next comStatus
+        // credit; relay: freed).
         this->txComplete(r, Fw::Success::SUCCESS);
         this->fskRx(r, 0);
+        // Listen-only gap before our next TX, so the peer can get a word in.
+        this->lbtTurnaround(r);
     }
 
     if ((irq & LR20XX_SYSTEM_IRQ_RX_DONE) != 0) {
@@ -609,9 +624,15 @@ void LR2021Manager ::fskService(RadioSlot& r) {
     const U32 error_mask =
         LR20XX_SYSTEM_IRQ_TIMEOUT | LR20XX_SYSTEM_IRQ_CRC_ERROR | LR20XX_SYSTEM_IRQ_LEN_ERROR;
     if ((irq & error_mask) != 0) {
-        // A TX timeout also ends any in-flight transmission.
-        r.txInFlight = false;
         this->log_WARNING_HI_FskError(static_cast<U8>(r.idx), static_cast<U32>(irq));
+        // A TX timeout ends the in-flight transmission: drop its frame so the
+        // slot (and the downlink credit) is not held forever, then listen.
+        if (r.txInFlight) {
+            r.txInFlight = false;
+            r.cadListening = false;
+            this->txDrop(r);
+            this->fskRx(r, 0);
+        }
     }
 }
 

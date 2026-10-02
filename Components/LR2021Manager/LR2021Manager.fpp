@@ -210,6 +210,35 @@ module LR2021 {
             interval_ms: U32 @< Minimum spacing between packets, in ms (0 = as fast as possible)
         )
 
+        @ Set the listen-before-talk (half-duplex channel access) configuration
+        @ of one radio. Link-aware carrier sense (hold TX while a frame of our
+        @ own link is arriving) is always on; this selects the hardware CAD-LBT
+        @ energy gate (LR2021 RSSI CAD, TX only if the TX channel stayed below
+        @ threshold_dbm for listen_us) and the retry policy: a busy channel
+        @ defers the frame by a random backoff in [backoff_min_ms,
+        @ backoff_max_ms]; after max_attempts busy results it is sent anyway.
+        @ turnaround_ms is a listen-only gap after each own TX that gives the
+        @ peer a chance to start its frame (size it above the peer's reaction
+        @ time; 0 = back-to-back TX allowed).
+        @ Persists across RadioSetMode until RadioLbtDefault. Calibrate the
+        @ threshold against the FskNoiseFloor / FlrcNoiseFloor telemetry.
+        async command RadioLbtConfig(
+            radio: U8 @< Radio index (0 or 1)
+            cad: Fw.Enabled @< Hardware CAD-LBT energy gate
+            threshold_dbm: I16 @< CAD busy threshold in dBm (-255 .. 0)
+            listen_us: U32 @< CAD listen window in us (1 .. 500000)
+            backoff_min_ms: U16 @< Random backoff lower bound, ms
+            backoff_max_ms: U16 @< Random backoff upper bound, ms (>= backoff_min_ms)
+            max_attempts: U8 @< Busy results per frame before it is sent anyway (>= 1)
+            turnaround_ms: U16 @< Listen-only gap after each own TX, ms (0 = none)
+        )
+
+        @ Return one radio to the per-mode default LBT configuration
+        @ (LBT_FSK_* / LBT_FLRC_* in LR2021Cfg.hpp), reloaded on every mode change
+        async command RadioLbtDefault(
+            radio: U8 @< Radio index (0 or 1)
+        )
+
         # ----------------------------------------------------------------------
         # Events
         # ----------------------------------------------------------------------
@@ -280,6 +309,23 @@ module LR2021 {
         event TxFrameDropped(radio: U8) severity warning high \
             format "TX frame dropped (radio {} not ready)" throttle 5
 
+        @ LBT configuration of a radio changed
+        event LbtConfigSet(radio: U8, cad: Fw.Enabled, threshold_dbm: I16, listen_us: U32, \
+                           backoff_min_ms: U16, backoff_max_ms: U16, max_attempts: U8, \
+                           turnaround_ms: U16) \
+            severity activity high \
+            format "Radio {} LBT: CAD {}, threshold {} dBm, listen {} us, backoff {}..{} ms, max attempts {}, turnaround {} ms"
+
+        @ RadioLbtConfig arguments out of range
+        event LbtConfigInvalid(radio: U8) severity warning low \
+            format "Radio {} LBT config rejected: argument out of range"
+
+        @ The channel stayed busy for max_attempts tries; the frame was sent
+        @ anyway. Frequent occurrences mean the CAD threshold is below the
+        @ local noise floor (or the peer never pauses).
+        event LbtForced(radio: U8, attempts: U8) severity warning low \
+            format "Radio {} channel busy after {} attempts, TX forced" throttle 10
+
         @ FLRC packet transmission completed
         event FlrcTxDone(radio: U8) severity activity high \
             format "FLRC TX done (radio {})"
@@ -347,6 +393,21 @@ module LR2021 {
 
         @ Packets transmitted but not received during the last BER test
         telemetry BerPacketsLost: U32 update on change
+
+        @ TX attempts deferred because the channel was busy (link-aware
+        @ carrier sense or CAD-LBT), all radios
+        telemetry LbtBusyCount: U32 update on change
+
+        @ Frames sent after max_attempts busy results (LbtForced), all radios
+        telemetry LbtForcedCount: U32 update on change
+
+        @ Idle-channel RSSI of the FSK radio, in dBm: the lowest instantaneous
+        @ RSSI sampled while idling in RX over the last report window. Use it
+        @ to set the CAD-LBT threshold a few dB above the local noise floor.
+        telemetry FskNoiseFloor: I16 update on change
+
+        @ Idle-channel RSSI of the FLRC radio, in dBm (as FskNoiseFloor)
+        telemetry FlrcNoiseFloor: I16 update on change
 
         # ----------------------------------------------------------------------
         # Radio interface ports

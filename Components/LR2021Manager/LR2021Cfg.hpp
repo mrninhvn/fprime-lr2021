@@ -262,4 +262,118 @@ constexpr uint32_t FSK_TX_TIMEOUT_MS = 5000;
 // RTC-step value selecting RX continuous mode (see lr20xx_radio_common.h).
 constexpr uint32_t FSK_RX_CONTINUOUS = 0xFFFFFF;
 
+// ---------------------------------------------------------------------------
+// Listen-before-talk (half-duplex channel access)
+//
+// Every radio link is half-duplex, so a node must not key up while its peer
+// is transmitting to it. Two independent gates run before each TX:
+//
+//  1. Link-aware carrier sense (always on): the radio already sits in RX, so
+//     a PREAMBLE_DETECTED / SYNC_WORD_HEADER_VALID IRQ without RX_DONE means
+//     a frame of OUR link is arriving. Only our own modulation / syncword
+//     triggers it, so foreign users of a crowded band do not hold off TX.
+//
+//  2. Hardware CAD-LBT (configurable per radio): the LR2021 non-LoRa CAD
+//     (SetCadParams exit_mode = TX) measures RSSI on the TX channel for the
+//     listen window and only keys the PA if it stayed below the threshold;
+//     otherwise CAD_DETECTED is raised and the chip falls back to standby.
+//     This is plain energy detection: useful on the quiet S-band link, but
+//     on 70 cm amateur UHF the spacecraft sees the whole footprint's
+//     emitters and the ground sees the satellite near the noise floor, so
+//     it is off by default for FSK. Calibrate thresholds against the
+//     FskNoiseFloor / FlrcNoiseFloor telemetry before enabling.
+//
+// A busy channel defers the frame by a random backoff and retries; after
+// LBT_MAX_ATTEMPTS busy results the frame is sent anyway (a saturated or
+// mis-thresholded channel must never stall the link).
+//
+// Turnaround window: after each of its own transmissions a node keeps
+// listening for turnaroundMs before it may key up again. Without it a node
+// with a backlog sends back to back: its next frame starts within one run
+// tick of TX_DONE, long before the peer has even seen the previous one end
+// (the peer needs its RX latency + TX latency to react), so the peer's frame
+// lands on top of the next one and both are lost (seen on the UHF bench with
+// the SDR ground station: TM lost under every TC). If the peer's preamble /
+// syncword arrives inside the window, link-aware sense holds TX until its
+// frame has been received. Size it above the peer's reaction time; it costs
+// downlink throughput only while there is a backlog.
+// ---------------------------------------------------------------------------
+
+// Channel-access attempts per frame before it is transmitted regardless.
+#ifndef LBT_MAX_ATTEMPTS
+#define LBT_MAX_ATTEMPTS 8
+#endif
+
+// FSK (UHF, 9600 bps) defaults. Backoff covers about one TM/TC packet
+// (~220 ms on the air) so a deferred node lets the peer's burst finish.
+#ifndef LBT_FSK_CAD_ENABLED
+#define LBT_FSK_CAD_ENABLED false
+#endif
+#ifndef LBT_FSK_THRESHOLD_DBM
+#define LBT_FSK_THRESHOLD_DBM (-100)
+#endif
+#ifndef LBT_FSK_LISTEN_US
+#define LBT_FSK_LISTEN_US 5000  // ~48 bits at 9600 bps
+#endif
+#ifndef LBT_FSK_BACKOFF_MIN_MS
+#define LBT_FSK_BACKOFF_MIN_MS 50
+#endif
+#ifndef LBT_FSK_BACKOFF_MAX_MS
+#define LBT_FSK_BACKOFF_MAX_MS 400
+#endif
+#ifndef LBT_FSK_TURNAROUND_MS
+// The SDR ground station's reaction time (USB RX + TX buffering) is tens of
+// ms to ~150 ms; measure it with the ground modem's loopback-latency log.
+#define LBT_FSK_TURNAROUND_MS 200
+#endif
+
+// FLRC (S-band) defaults. Packets last a few ms, so the backoff is short.
+#ifndef LBT_FLRC_CAD_ENABLED
+#define LBT_FLRC_CAD_ENABLED true
+#endif
+#ifndef LBT_FLRC_THRESHOLD_DBM
+#define LBT_FLRC_THRESHOLD_DBM (-90)
+#endif
+#ifndef LBT_FLRC_LISTEN_US
+#define LBT_FLRC_LISTEN_US 500
+#endif
+#ifndef LBT_FLRC_BACKOFF_MIN_MS
+#define LBT_FLRC_BACKOFF_MIN_MS 5
+#endif
+#ifndef LBT_FLRC_BACKOFF_MAX_MS
+#define LBT_FLRC_BACKOFF_MAX_MS 50
+#endif
+#ifndef LBT_FLRC_TURNAROUND_MS
+// S-band runs split TX/RX frequencies: the peer's uplink does not collide
+// with our downlink, so no gap is needed.
+#define LBT_FLRC_TURNAROUND_MS 0
+#endif
+
+// Longest a peer frame can occupy the channel once its syncword is seen
+// (link-aware hold, released early by RX_DONE / an RX error). FSK: the
+// largest fixed packet (256 B) at the FSK bit rate, plus margin. FLRC: the
+// largest payload at the raw rate with rate-1/2 coding, plus margin.
+constexpr uint32_t LBT_FSK_FRAME_HOLD_US =
+    static_cast<uint32_t>((8ULL * 256ULL * 1000000ULL) / FSK_BITRATE_BPS) + 20000u;
+constexpr uint32_t LBT_FLRC_FRAME_HOLD_US =
+    static_cast<uint32_t>((2ULL * 8ULL * LR2021::LR2021Manager::FLRC_MAX_PAYLOAD * 1000000ULL) /
+                          FLRC_RAW_BITRATE_BPS) + 2000u;
+
+// Hold after a preamble detection that has not (yet) produced a syncword:
+// preamble + syncword airtime, plus margin. A false preamble detection on
+// noise therefore costs at most this long.
+constexpr uint32_t LBT_FSK_PREAMBLE_HOLD_US =
+    static_cast<uint32_t>((2ULL * (FSK_PREAMBLE_BITS + 32ULL) * 1000000ULL) / FSK_BITRATE_BPS);
+constexpr uint32_t LBT_FLRC_PREAMBLE_HOLD_US = 1000u;
+
+// Idle-channel RSSI telemetry (FskNoiseFloor / FlrcNoiseFloor): sampled every
+// LBT_NOISE_SAMPLE_MS while the radio idles in RX; the minimum over each
+// LBT_NOISE_REPORT_MS window is reported (bursts of traffic are excluded).
+#ifndef LBT_NOISE_SAMPLE_MS
+#define LBT_NOISE_SAMPLE_MS 100
+#endif
+#ifndef LBT_NOISE_REPORT_MS
+#define LBT_NOISE_REPORT_MS 2000
+#endif
+
 #endif /* _LR2021_LR2021CFG_HPP_ */
