@@ -21,9 +21,11 @@
 #include <Os/Console.hpp>
 #include <Fw/Types/String.hpp>
 
-#define DEBUG_CONSOLE 1
+// Console debug lines (DEBUG()) and per-packet hex dumps (logHex): 1 = on, 0 = off.
+// Off for throughput: at S-band rates each line costs ~4 ms on the 115200-baud console.
+#define DEBUG_CONSOLE 0
 
-#ifdef DEBUG_CONSOLE
+#if DEBUG_CONSOLE
 #define DEBUG(msg, ...) do { \
     char _dbg_buf[128]; \
     snprintf(_dbg_buf, sizeof(_dbg_buf), "[LR2021] %s: " msg "\n", __func__, ##__VA_ARGS__); \
@@ -134,6 +136,7 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
         Fw::Time txRetryTime;       //!< Earliest retry of the held frame
         U8 txAttempts = 0;          //!< Busy results seen for the current frame
         Fw::Time peerBusyUntil;     //!< Link-aware hold: peer frame on the air until then
+        const char* busyCause = "";  //!< What held the last busy channel-access attempt
         Fw::Time txQuietUntil;      //!< Turnaround: no own TX before then (listen only)
         I16 noiseMinDbm = 0;        //!< Lowest idle RSSI in the current report window
         bool noiseValid = false;    //!< noiseMinDbm holds at least one sample
@@ -355,7 +358,8 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     bool txSend(RadioSlot& r);
 
     //! Hold the working frame of \p r for a random backoff (channel busy).
-    void lbtDefer(RadioSlot& r);
+    //! \p why names the gate that found it busy ("peer" link-aware sense, "CAD" energy), for the log.
+    void lbtDefer(RadioSlot& r, const char* why);
 
     //! Open the turnaround window of \p r (listen-only for lbt.turnaroundMs).
     //! Call after our TX_DONE, once RX is re-armed, so the whole window is

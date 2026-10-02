@@ -59,13 +59,9 @@ bool deadlinePassed(const Fw::Time& now, const Fw::Time& deadline, U32 max_wait_
     return left_us > max_wait_us;
 }
 
-// Link-aware hold lengths for the mode of \p r.
+// Link-aware hold length (syncword to frame end) for the mode of \p r.
 U32 frameHoldUs(const LR2021Manager::RadioSlot& r) {
     return (r.mode == LR2021Manager::RadioMode::FLRC) ? LBT_FLRC_FRAME_HOLD_US : LBT_FSK_FRAME_HOLD_US;
-}
-
-U32 preambleHoldUs(const LR2021Manager::RadioSlot& r) {
-    return (r.mode == LR2021Manager::RadioMode::FLRC) ? LBT_FLRC_PREAMBLE_HOLD_US : LBT_FSK_PREAMBLE_HOLD_US;
 }
 
 // Longest legitimate wait for a held frame: a backoff or a turnaround window.
@@ -179,9 +175,9 @@ bool LR2021Manager ::txSend(RadioSlot& r) {
         // threshold below the noise floor must not stall the link).
         this->m_lbtForcedCount++;
         this->tlmWrite_LbtForcedCount(this->m_lbtForcedCount);
-        this->log_WARNING_LO_LbtForced(static_cast<U8>(r.idx), r.txAttempts);
+        this->log_WARNING_LO_LbtForced(static_cast<U8>(r.idx), r.txAttempts, Fw::LogStringArg(r.busyCause));
     } else if (this->lbtPeerBusy(r)) {
-        this->lbtDefer(r);
+        this->lbtDefer(r, r.busyCause);
         return true;
     }
 
@@ -197,7 +193,7 @@ bool LR2021Manager ::txSend(RadioSlot& r) {
     }
 }
 
-void LR2021Manager ::lbtDefer(RadioSlot& r) {
+void LR2021Manager ::lbtDefer(RadioSlot& r, const char* why) {
     const Fw::Time now = this->getTime();
     if (r.txAttempts < 0xFF) {
         r.txAttempts++;
@@ -205,6 +201,7 @@ void LR2021Manager ::lbtDefer(RadioSlot& r) {
     r.txInFlight = false;
     r.cadListening = false;
     r.txHeld = true;
+    r.busyCause = why;
 
     // Random backoff in [min, max] ms (xorshift32). The clock's microseconds
     // are mixed in so two nodes that boot identically never draw the same
@@ -223,7 +220,7 @@ void LR2021Manager ::lbtDefer(RadioSlot& r) {
 
     this->m_lbtBusyCount++;
     this->tlmWrite_LbtBusyCount(this->m_lbtBusyCount);
-    DEBUG("radio %d channel busy, attempt %u, retry in %u ms", static_cast<int>(r.idx),
+    DEBUG("radio %d channel busy (%s), attempt %u, retry in %u ms", static_cast<int>(r.idx), why,
           static_cast<unsigned>(r.txAttempts), static_cast<unsigned>(backoff_ms));
 }
 
@@ -241,6 +238,7 @@ bool LR2021Manager ::lbtPeerBusy(RadioSlot& r) {
         // A packet received but not read yet: transmitting now would clear the
         // RX FIFO on the TX->RX turnaround. Let the service loop take it first.
         if ((irq & LR20XX_SYSTEM_IRQ_RX_DONE) != 0) {
+            r.busyCause = "peer: RX_DONE not read";
             return true;
         }
         this->lbtTrackIrq(r, static_cast<U32>(irq));
@@ -258,12 +256,17 @@ void LR2021Manager ::lbtTrackIrq(RadioSlot& r, U32 irq) {
     if ((irq & LR20XX_SYSTEM_IRQ_SYNC_WORD_HEADER_VALID) != 0) {
         // Our link's syncword: a peer frame is on the air until RX_DONE.
         r.peerBusyUntil = timeAfterUs(now, frameHoldUs(r));
-    } else if ((irq & LR20XX_SYSTEM_IRQ_PREAMBLE_DETECTED) != 0) {
+        r.busyCause = "peer: syncword";
+    } else if (((irq & LR20XX_SYSTEM_IRQ_PREAMBLE_DETECTED) != 0) && (r.mode != LR2021Manager::RadioMode::FLRC)) {
         // Preamble only: hold for the preamble + syncword airtime, never
-        // shortening a syncword hold already running.
-        const Fw::Time until = timeAfterUs(now, preambleHoldUs(r));
+        // shortening a syncword hold already running. FSK only: the FLRC
+        // preamble detector fires on noise (bench: every attempt of ~80% of
+        // S-band frames read busy, all forced), and an FLRC preamble buys no
+        // warning anyway (32 bits = 49 us at 650 kbps before the syncword).
+        const Fw::Time until = timeAfterUs(now, LBT_FSK_PREAMBLE_HOLD_US);
         if (!(r.peerBusyUntil > until)) {
             r.peerBusyUntil = until;
+            r.busyCause = "peer: preamble";
         }
     }
 }
@@ -275,7 +278,7 @@ bool LR2021Manager ::lbtCadDone(RadioSlot& r, U32 irq) {
     r.cadListening = false;
     if ((irq & LR20XX_SYSTEM_IRQ_CAD_DETECTED) != 0) {
         // Busy: the chip did not key up and is back in its fallback standby.
-        this->lbtDefer(r);
+        this->lbtDefer(r, "CAD energy");
         return true;
     }
     // Clear: the chip went straight into TX. Sample the RF detectors if the

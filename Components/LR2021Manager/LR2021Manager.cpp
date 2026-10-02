@@ -145,6 +145,13 @@ void LR2021Manager ::logDebug(const Fw::LogStringArg& msg) {
 }
 
 void LR2021Manager ::logHex(const char* tag, const U8* data, U16 len) {
+#if !DEBUG_CONSOLE
+    // Per-packet hex dumps (FSK/FLRC RX, CLTU) are debug output: compiled in only with
+    // DEBUG_CONSOLE (LR2021Manager.hpp), like the DEBUG() console lines.
+    (void)tag;
+    (void)data;
+    (void)len;
+#else
     char buf[128];
     int off = snprintf(buf, sizeof(buf), "%s:", tag);
     for (U16 i = 0; (i < len) && (off > 0) && (off < static_cast<int>(sizeof(buf) - 4)); i++) {
@@ -152,6 +159,7 @@ void LR2021Manager ::logHex(const char* tag, const U8* data, U16 len) {
     }
     Fw::LogStringArg msg(buf);
     this->log_DIAGNOSTIC_LR2021(msg);
+#endif
 }
 
 // ----------------------------------------------------------------------

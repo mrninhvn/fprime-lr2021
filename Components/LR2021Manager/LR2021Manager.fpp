@@ -323,8 +323,8 @@ module LR2021 {
         @ The channel stayed busy for max_attempts tries; the frame was sent
         @ anyway. Frequent occurrences mean the CAD threshold is below the
         @ local noise floor (or the peer never pauses).
-        event LbtForced(radio: U8, attempts: U8) severity warning low \
-            format "Radio {} channel busy after {} attempts, TX forced" throttle 10
+        event LbtForced(radio: U8, attempts: U8, cause: string size 32) severity warning low \
+            format "Radio {} channel busy after {} attempts ({}), TX forced" throttle 10
 
         @ FLRC packet transmission completed
         event FlrcTxDone(radio: U8) severity activity high \

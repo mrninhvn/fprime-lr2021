@@ -329,7 +329,12 @@ constexpr uint32_t FSK_RX_CONTINUOUS = 0xFFFFFF;
 
 // FLRC (S-band) defaults. Packets last a few ms, so the backoff is short.
 #ifndef LBT_FLRC_CAD_ENABLED
-#define LBT_FLRC_CAD_ENABLED true
+// Off: S-band runs split frequencies, and the CAD measures our own TX channel
+// (2250 MHz) right after the retune from RX, where the peer never transmits
+// (its uplink is 2270 MHz, covered by the link-aware sense). On the bench it
+// read busy on 8 of 8 attempts for ~80% of frames (noise floor -106 dBm on RX),
+// forcing every frame after ~0.2 s of backoff. RadioLbtConfig re-enables it.
+#define LBT_FLRC_CAD_ENABLED false
 #endif
 #ifndef LBT_FLRC_THRESHOLD_DBM
 #define LBT_FLRC_THRESHOLD_DBM (-90)
@@ -359,12 +364,12 @@ constexpr uint32_t LBT_FLRC_FRAME_HOLD_US =
     static_cast<uint32_t>((2ULL * 8ULL * LR2021::LR2021Manager::FLRC_MAX_PAYLOAD * 1000000ULL) /
                           FLRC_RAW_BITRATE_BPS) + 2000u;
 
-// Hold after a preamble detection that has not (yet) produced a syncword:
+// FSK hold after a preamble detection that has not (yet) produced a syncword:
 // preamble + syncword airtime, plus margin. A false preamble detection on
-// noise therefore costs at most this long.
+// noise therefore costs at most this long. FLRC ignores preamble detections
+// (its detector fires on noise), and holds on the syncword only.
 constexpr uint32_t LBT_FSK_PREAMBLE_HOLD_US =
     static_cast<uint32_t>((2ULL * (FSK_PREAMBLE_BITS + 32ULL) * 1000000ULL) / FSK_BITRATE_BPS);
-constexpr uint32_t LBT_FLRC_PREAMBLE_HOLD_US = 1000u;
 
 // Idle-channel RSSI telemetry (FskNoiseFloor / FlrcNoiseFloor): sampled every
 // LBT_NOISE_SAMPLE_MS while the radio idles in RX; the minimum over each

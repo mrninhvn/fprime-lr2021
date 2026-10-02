@@ -329,7 +329,9 @@ void LR2021Manager ::flrcService(RadioSlot& r) {
         this->tlmWrite_FlrcRxCount(this->m_rxCount);
         this->tlmWrite_FlrcRssi(pkt_status.rssi_avg_in_dbm);
         this->sendRssiPoly(Svc::PolyDbCfg::PolyDbEntry::POLYDB_ENTRY_OBC_FLRC_RSSI, pkt_status.rssi_avg_in_dbm);
-        this->log_ACTIVITY_HI_FlrcRxPacket(static_cast<U8>(r.idx), pkt_len, pkt_status.rssi_avg_in_dbm);
+        // Per-packet event disabled: at S-band file rates (~100 frames/s) it floods the event
+        // stream and the console; FlrcRxCount / FlrcRssi carry the same information.
+        // this->log_ACTIVITY_HI_FlrcRxPacket(static_cast<U8>(r.idx), pkt_len, pkt_status.rssi_avg_in_dbm);
         this->flrcRx(r, 0);
     }
 
