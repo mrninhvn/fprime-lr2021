@@ -31,11 +31,14 @@ module LR2021 {
         @ Downlink source queue routed by SET_TX_ROUTE. Values match the
         @ comQueueIndex the topology assigns each ComQueue queue (EVENTS=0,
         @ TELEMETRY=1, FILE=Svc.ComQueue.COM_PORT_COUNT+0=2): must be kept in
-        @ sync with the ComCcsds subtopology's queue layout.
+        @ sync with the ComCcsds subtopology's queue layout. BEACON (3) is not a
+        @ ComQueue queue: it is the route-table entry of the beacon frames this
+        @ component builds itself (beaconIn).
         enum RouteQueue {
             EVT @< Event packets (ComQueue EVENTS queue)
             TLM @< Telemetry packets (ComQueue TELEMETRY queue)
             FILE @< File downlink buffers (ComQueue FILE buffer queue)
+            BEACON @< Beacon frames framed by this component (beaconIn)
         }
 
         @ Downlink route target: a radio index (0 or 1) or UART_RADIO (2, the
@@ -103,6 +106,22 @@ module LR2021 {
         async input port relayIn: Svc.ComDataWithContext
 
         # ----------------------------------------------------------------------
+        # Beacon TX
+        # ----------------------------------------------------------------------
+
+        @ Beacon packet to transmit: an F Prime packet [U16 descriptor = APID]
+        @ [data]. Framed here (space packet + TM frame on the F Prime TM virtual
+        @ channel, own APID sequence count, idle-packet fill) and sent between
+        @ framer frames on the BEACON route, outside the comStatus credit flow,
+        @ so beacons go out even if the framer stack is stalled. The packet is
+        @ copied and the buffer returned at once on beaconReturnOut. Needs
+        @ setTmFraming(); a newer beacon replaces one not yet sent.
+        async input port beaconIn: Fw.BufferSend
+
+        @ Returns the beaconIn buffer (right after it is copied)
+        output port beaconReturnOut: Fw.BufferSend
+
+        # ----------------------------------------------------------------------
         # PolyDb
         # ----------------------------------------------------------------------
 
@@ -163,7 +182,7 @@ module LR2021 {
         @ two routes. Mirrors the topology's setTxRoute() call, callable from
         @ the ground. Takes effect on the next frame of that queue.
         async command RadioTxRoute(
-            source: RouteQueue @< Downlink source to retarget
+            source: RouteQueue @< Downlink source to retarget (EVT / TLM / FILE / BEACON)
             target: U8 @< Radio index (0 or 1), or 2 for UART
         )
 
@@ -309,6 +328,11 @@ module LR2021 {
         event TxFrameDropped(radio: U8) severity warning high \
             format "TX frame dropped (radio {} not ready)" throttle 5
 
+        @ A beacon was not sent: replaced by a newer one before its turn, not
+        @ framed (too long, bad APID, setTmFraming() not called) or its TX failed
+        event BeaconDropped(target: U8) severity warning low \
+            format "Beacon dropped (route target {})" throttle 5
+
         @ LBT configuration of a radio changed
         event LbtConfigSet(radio: U8, cad: Fw.Enabled, threshold_dbm: I16, listen_us: U32, \
                            backoff_min_ms: U16, backoff_max_ms: U16, max_attempts: U8, \
@@ -397,6 +421,12 @@ module LR2021 {
         @ TX attempts deferred because the channel was busy (link-aware
         @ carrier sense or CAD-LBT), all radios
         telemetry LbtBusyCount: U32 update on change
+
+        @ Beacon frames transmitted (radio TX done or UART send OK)
+        telemetry BeaconTxCount: U32 update on change
+
+        @ Beacons not transmitted (see BeaconDropped)
+        telemetry BeaconDropCount: U32 update on change
 
         @ Frames sent after max_attempts busy results (LbtForced), all radios
         telemetry LbtForcedCount: U32 update on change

@@ -127,6 +127,11 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
         ComCfg::FrameContext workingContext;  //!< Frame context of the in-flight TX
         bool relayFrame = false;    //!< workingBuffer came from relayIn: free it when
                                     //!< done (no dataReturnOut / comStatus credit)
+        bool beaconFrame = false;   //!< workingBuffer wraps m_beaconFrame: nothing to
+                                    //!< free, no dataReturnOut / comStatus credit
+        Fw::Buffer pendingFramer;   //!< Framer frame that arrived while this slot sent a
+                                    //!< beacon: sent by run() once the slot is free
+        ComCfg::FrameContext pendingFramerContext;  //!< Frame context of pendingFramer
 
         // Listen-before-talk (see LR2021Cfg.hpp)
         LbtCfg lbt;                 //!< Active LBT configuration
@@ -233,6 +238,17 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! \p radioIdx. Unconfigured queue indices go to radio 0. Called from
     //! the topology (e.g. route the FILE buffer queue to the S-band radio).
     void setTxRoute(FwIndexType comQueueIndex, FwIndexType radioIdx);
+
+    //! Enable TM framing in this component: the beacon frames built from
+    //! beaconIn, and the egress frame-count ownership. \p scid / \p vcid are
+    //! those of the F Prime TM frames (the framer's), \p frameSize the fixed
+    //! TM frame size. From then on every TM frame of that SCID/VCID sent by
+    //! this component (framer frames and beacons, any radio or UART) gets its
+    //! master / virtual channel frame counts re-stamped in send order and its
+    //! FECF recomputed, so beacons slot into one continuous count sequence.
+    //! Without this call beaconIn drops every beacon and framer frames are
+    //! sent untouched.
+    void setTmFraming(U16 scid, U8 vcid, U16 frameSize);
 
     //! Select where received packets are forwarded: the Svc.Com dataOut port
     //! (RxSink::DATA_OUT, default / flight) or straight out the byte-stream
@@ -505,6 +521,10 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
                               const Drv::ByteStreamStatus& recvStatus  //!< Receive status
                               ) override;
 
+    //! Handler implementation for beaconIn: copy the beacon packet, return
+    //! the buffer, and send it as a TM frame when its route target is free.
+    void beaconIn_handler(FwIndexType portNum, Fw::Buffer& fwBuffer) override;
+
     //! Handler implementation for relayIn: transmit a complete frame out the
     //! radio verbatim (fire-and-forget), then free the buffer. Async: runs on
     //! this component's thread, serialized with run().
@@ -639,6 +659,19 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! for the com queues plus the buffer (file) queues of the deployment.
     static constexpr FwIndexType TX_ROUTE_TABLE_SIZE = 8;
 
+    //! Route-table entry of the beacon frames (RouteQueue::BEACON).
+    static constexpr FwIndexType BEACON_ROUTE = 3;
+
+    //! Largest TM frame this component frames / stamps, in bytes.
+    static constexpr U16 TM_FRAME_MAX_SIZE = 256;
+
+    //! TM frame overhead around a beacon space packet: TM primary header (6),
+    //! space packet header (6), minimum idle packet (7), FECF (2).
+    static constexpr U16 TM_BEACON_OVERHEAD = 6 + 6 + 7 + 2;
+
+    //! Distinct beacon APIDs with their own space packet sequence count.
+    static constexpr FwIndexType BEACON_APID_SLOTS = 4;
+
     //! Select the TX radio for a downlink frame from its frame context
     //! (route table lookup on comQueueIndex; out-of-table indices -> radio 0).
     FwIndexType routeTx(const ComCfg::FrameContext& context) const;
@@ -658,6 +691,29 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! apart). Allocates a buffer from the buffer manager and always returns
     //! it. Does nothing when \p data is nullptr or \p len is 0.
     void forwardRxPacket(FwIndexType idx, const U8* data, U16 len);
+
+    //! Put the framer frame \p data on radio \p idx (slot must be free):
+    //! stamp it, make it the slot's working frame and start txSend(). On a
+    //! failure the frame is returned with a FAILURE comStatus.
+    void startFramerTx(FwIndexType idx, Fw::Buffer& data, const ComCfg::FrameContext& context);
+
+    //! Re-stamp the master / virtual channel frame counts of a TM frame and
+    //! recompute its FECF, if it is a frame of the configured SCID/VCID and
+    //! size (see setTmFraming). Call right before the frame is sent.
+    void stampTmFrame(U8* frame, FwSizeType len);
+
+    //! Build the TM frame of the pending beacon packet into m_beaconFrame:
+    //! TM header (counts stamped later), space packet with the beacon's APID
+    //! and its own sequence count, idle-packet fill.
+    void buildBeaconFrame();
+
+    //! Send the pending beacon on its route if the target can take it now
+    //! (radio slot free and in a packet mode, no BER test on it), else keep
+    //! it pending. Called from beaconIn and from run() every tick.
+    void serviceBeacon();
+
+    //! Count and report a beacon that was not sent.
+    void beaconDropped(FwIndexType target);
 
     //! Ground uplink relay: transmit the bytes in \p data over the radio.
     //! Full route to radio 0 for now (TODO: route by CCSDS APID). Takes
@@ -725,6 +781,24 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     U32 m_lbtBusyCount = 0;         //!< TX deferrals on a busy channel (all radios)
     U32 m_lbtForcedCount = 0;       //!< Frames sent after maxAttempts busy results
     U32 m_lbtRng = 0x9E3779B9u;     //!< Backoff PRNG state (xorshift32, never 0)
+
+    // TM framing (setTmFraming): beacon frames + egress frame-count ownership
+    bool m_tmFraming = false;       //!< setTmFraming() called
+    U16 m_tmScid = 0;               //!< SCID of the F Prime TM frames
+    U8 m_tmVcid = 0;                //!< VCID of the F Prime TM frames
+    U16 m_tmFrameSize = 0;          //!< Fixed TM frame size
+    U8 m_mcFrameCount = 0;          //!< Next master channel frame count (mod 256)
+    U8 m_vcFrameCount = 0;          //!< Next virtual channel frame count (mod 256)
+    U8 m_beaconPacket[TM_FRAME_MAX_SIZE];  //!< Pending beacon packet (descriptor + data)
+    U16 m_beaconPacketLen = 0;      //!< Its length
+    bool m_beaconPending = false;   //!< m_beaconPacket waits for its turn
+    bool m_beaconInFlight = false;  //!< m_beaconFrame is in use by a radio slot
+    U8 m_beaconFrame[TM_FRAME_MAX_SIZE];   //!< Beacon TM frame being sent
+    U16 m_beaconApid[BEACON_APID_SLOTS] = {0};  //!< APIDs seen on beaconIn
+    U16 m_beaconSeq[BEACON_APID_SLOTS] = {0};   //!< Next sequence count per APID
+    FwIndexType m_beaconApidCount = 0;          //!< Used entries of m_beaconApid
+    U32 m_beaconTxCount = 0;        //!< Beacon frames sent
+    U32 m_beaconDropCount = 0;      //!< Beacons not sent
 };
 
 }  // namespace LR2021

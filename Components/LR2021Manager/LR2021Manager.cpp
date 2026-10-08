@@ -253,6 +253,19 @@ void LR2021Manager ::txComplete(RadioSlot& r, Fw::Success status) {
         ComCfg::FrameContext context = r.workingContext;
         r.workingBuffer = Fw::Buffer();
         r.workingContext = ComCfg::FrameContext();
+        if (r.beaconFrame) {
+            // Beacon frames are outside the com flow and live in m_beaconFrame:
+            // nothing to free, no credit.
+            r.beaconFrame = false;
+            this->m_beaconInFlight = false;
+            if (status == Fw::Success::SUCCESS) {
+                this->m_beaconTxCount++;
+                this->tlmWrite_BeaconTxCount(this->m_beaconTxCount);
+            } else {
+                this->beaconDropped(r.idx);
+            }
+            return;
+        }
         if (r.relayFrame) {
             // Relay frames are outside the com flow: just free the buffer.
             r.relayFrame = false;
@@ -463,7 +476,19 @@ void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
         // peer-activity flags are current): retry LBT-held frames, sample
         // the idle-channel noise floor.
         this->lbtRun(r);
+
+        // A framer frame held back by a beacon: send it once the slot is free.
+        if (r.pendingFramer.isValid() && !r.workingBuffer.isValid() && !r.txInFlight) {
+            Fw::Buffer frame = r.pendingFramer;
+            const ComCfg::FrameContext frameContext = r.pendingFramerContext;
+            r.pendingFramer = Fw::Buffer();
+            r.pendingFramerContext = ComCfg::FrameContext();
+            this->startFramerTx(i, frame, frameContext);
+        }
     }
+
+    // Pending beacon: on the air as soon as its route target is free.
+    this->serviceBeacon();
 
     // Drive the non-blocking BER test (if one is running): the per-slot
     // service above already cleared txInFlight / tallied any RX_DONE this
@@ -583,6 +608,7 @@ void LR2021Manager ::dataIn_handler(FwIndexType portNum,
     if (idx == UART_RADIO) {
         Fw::Success comSuccess = Fw::Success::FAILURE;
         if (data.isValid() && this->isConnected_drvSendOut_OutputPort(0)) {
+            this->stampTmFrame(data.getData(), data.getSize());
             Drv::ByteStreamStatus st = Drv::ByteStreamStatus::SEND_RETRY;
             for (FwIndexType i = 0; (st == Drv::ByteStreamStatus::SEND_RETRY) && (i < UART_RETRY_LIMIT); i++) {
                 st = this->drvSendOut_out(0, data);
@@ -601,15 +627,34 @@ void LR2021Manager ::dataIn_handler(FwIndexType portNum,
 
     RadioSlot& r = this->m_radio[idx];
 
+    // The radio is sending a beacon (outside the credit flow): hold the frame
+    // and send it from run() once the beacon is done. The single comStatus
+    // credit means at most one framer frame can be waiting here.
+    if (r.beaconFrame && r.workingBuffer.isValid() && !r.pendingFramer.isValid() && data.isValid()) {
+        r.pendingFramer = data;
+        r.pendingFramerContext = context;
+        return;
+    }
+
+    this->startFramerTx(idx, data, context);
+}
+
+void LR2021Manager ::startFramerTx(FwIndexType idx, Fw::Buffer& data, const ComCfg::FrameContext& context) {
+    RadioSlot& r = this->m_radio[idx];
+
     // The framer stack sends one frame per comStatus credit, so the routed
     // radio is normally idle here; any local failure drops the frame. A busy
     // channel is not a failure: txSend() holds the frame for a backoff and
     // the next credit is granted only once it is on the air.
+    // A frame held back by a beacon may come up after a BER test took this radio: drop it as dataIn would.
+    const bool berOwned = this->m_ber.active && ((idx == this->m_ber.txRadio) || (idx == this->m_ber.rxRadio));
     bool ok = false;
-    if (data.isValid() && (data.getSize() > 0) && !r.workingBuffer.isValid() && !r.txInFlight) {
+    if (!berOwned && data.isValid() && (data.getSize() > 0) && !r.workingBuffer.isValid() && !r.txInFlight) {
+        this->stampTmFrame(data.getData(), data.getSize());
         r.workingBuffer = data;
         r.workingContext = context;
         r.relayFrame = false;
+        r.beaconFrame = false;
         r.txAttempts = 0;
         ok = this->txSend(r);
         if (!ok) {
