@@ -707,6 +707,14 @@ void LR2021Manager ::drvReceiveIn_handler(FwIndexType portNum,
     this->dataOut_out(0, recvBuffer, emptyContext);
 }
 
+void LR2021Manager ::drvReceiveIn_overflowHook(FwIndexType portNum,
+                                               Fw::Buffer& recvBuffer,
+                                               const Drv::ByteStreamStatus& recvStatus) {
+    // Queue full (thread stalled on a radio busy-wait): drop these UART bytes
+    // rather than assert; the deframer resyncs on the next frame.
+    this->deallocate_out(0, recvBuffer);
+}
+
 void LR2021Manager ::relayIn_handler(FwIndexType portNum, Fw::Buffer& data, const ComCfg::FrameContext& context) {
     // A complete frame routed to the radio by the APID router: transmit it
     // verbatim (fire-and-forget). relayUplink owns the buffer from here: LBT

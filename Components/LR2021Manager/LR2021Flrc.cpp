@@ -16,6 +16,7 @@
 #include "Components/LR2021Manager/LR2021Manager.hpp"
 #include "Components/LR2021Manager/LR2021Cfg.hpp"
 
+#include <Svc/Ccsds/Utils/CRC16.hpp>
 #include <cstring>
 
 extern "C" {
@@ -47,6 +48,28 @@ lr20xx_radio_flrc_pkt_params_t flrcPktParams(uint16_t pld_len) {
     params.pld_len_in_bytes = pld_len;
     params.crc_type         = FLRC_CRC;
     return params;
+}
+
+// Smallest CCSDS transfer frame worth checking: TC primary header (5) +
+// one data octet + FECF (2). A TM frame is larger still.
+constexpr U16 CCSDS_MIN_FRAME = 8;
+constexpr U16 CCSDS_FECF_SIZE = 2;
+
+// The FLRC link runs with the radio CRC off and variable length, so noise
+// that matches the 32-bit syncword is delivered as a random-length packet
+// (it showed up as NoBuffsAvailable for sizes beyond the comms buffers). The
+// UHF FSK path never forwards such noise because its CLTU BCH / fixed-length
+// decode rejects it; this is the FLRC equivalent: accept only a CCSDS TC or TM
+// transfer frame (version '00') whose Frame Error Control Field, the CRC-16
+// that F Prime's TC and TM framers append over the rest of the frame, matches.
+// The CRC covers the whole packet, so it also rejects a frame with a wrong
+// length; random noise passes with probability ~1/262144.
+bool ccsdsFrameValid(const U8* data, U16 len) {
+    if ((len < CCSDS_MIN_FRAME) || ((data[0] >> 6) != 0)) {
+        return false;
+    }
+    const U16 fecf = static_cast<U16>((data[len - 2] << 8) | data[len - 1]);
+    return Svc::Ccsds::Utils::CRC16::compute(data, static_cast<U32>(len - CCSDS_FECF_SIZE)) == fecf;
 }
 }  // namespace
 
@@ -318,7 +341,14 @@ void LR2021Manager ::flrcService(RadioSlot& r) {
         (void)lr20xx_radio_flrc_get_pkt_status(&r, &pkt_status);
 
         U8 payload[FLRC_MAX_PAYLOAD] = {0};
-        if ((pkt_len > 0) && (lr20xx_radio_fifo_read_rx(&r, payload, pkt_len) == LR20XX_STATUS_OK)) {
+        const bool read = (pkt_len > 0) && (lr20xx_radio_fifo_read_rx(&r, payload, pkt_len) == LR20XX_STATUS_OK);
+        if (read && !ccsdsFrameValid(payload, pkt_len)) {
+            // Noise on the syncword or a corrupted frame: drop it before a
+            // buffer is allocated, and keep it out of the RX count / RSSI.
+            this->flrcRx(r, 0);
+            return;
+        }
+        if (read) {
             this->logHex("FLRC RX", payload, (pkt_len > 32) ? 32 : pkt_len);
             // Forward to the configured RX sink: dataOut (frame accumulator) in
             // flight, or straight out the UART driver on a ground relay.

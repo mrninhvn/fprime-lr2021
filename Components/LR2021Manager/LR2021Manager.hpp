@@ -521,6 +521,12 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
                               const Drv::ByteStreamStatus& recvStatus  //!< Receive status
                               ) override;
 
+    //! Overflow hook for drvReceiveIn: the queue is full, drop the bytes and
+    //! free the driver's buffer (runs on the driver's thread).
+    void drvReceiveIn_overflowHook(FwIndexType portNum,
+                                   Fw::Buffer& recvBuffer,
+                                   const Drv::ByteStreamStatus& recvStatus) override;
+
     //! Handler implementation for beaconIn: copy the beacon packet, return
     //! the buffer, and send it as a TM frame when its route target is free.
     void beaconIn_handler(FwIndexType portNum, Fw::Buffer& fwBuffer) override;

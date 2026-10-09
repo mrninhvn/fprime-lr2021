@@ -92,8 +92,10 @@ module LR2021 {
 
         @ Uplink data received from the byte-stream driver, forwarded to dataOut
         @ (like a radio RX) for the deframe / APID-router stack. Async so it runs
-        @ on this component's thread.
-        async input port drvReceiveIn: Drv.ByteStreamData
+        @ on this component's thread. Hook on overflow: when the queue is full
+        @ (the thread stalled on a radio busy-wait) the bytes are dropped and
+        @ the buffer freed instead of asserting.
+        async input port drvReceiveIn: Drv.ByteStreamData hook
 
         # ----------------------------------------------------------------------
         # Relay TX (uplink routing target)
