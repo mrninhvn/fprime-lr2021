@@ -180,6 +180,11 @@ void LR2021Manager ::serviceBeacon() {
     }
     const FwIndexType idx = this->m_txRoute[BEACON_ROUTE];
 
+    if (idx == DISABLED_RADIO) {
+        this->m_beaconPending = false;  // route disabled: discard silently
+        return;
+    }
+
     if (idx == UART_RADIO) {
         // Synchronous send to the byte-stream driver, like dataIn's UART path
         this->m_beaconPending = false;
@@ -199,6 +204,21 @@ void LR2021Manager ::serviceBeacon() {
         } else {
             this->beaconDropped(idx);
         }
+        return;
+    }
+
+    if (idx == SDR_RADIO) {
+        // m_beaconFrame is out on sdrOut until sdrReturnIn hands it back
+        this->m_beaconPending = false;
+        if (!this->isConnected_sdrOut_OutputPort(0)) {
+            this->beaconDropped(idx);
+            return;
+        }
+        this->buildBeaconFrame();
+        this->stampTmFrame(this->m_beaconFrame, this->m_tmFrameSize);
+        this->m_beaconInFlight = true;
+        Fw::Buffer frame(this->m_beaconFrame, this->m_tmFrameSize);
+        this->sdrOut_out(0, frame);
         return;
     }
 

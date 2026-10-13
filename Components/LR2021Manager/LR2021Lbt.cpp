@@ -6,8 +6,9 @@
 //         of LR2021Cfg.hpp.
 //
 // Flow of one frame (dataIn / relayIn -> working buffer of the slot):
-//   txSend()      - turnaround window after our last TX still open -> hold
-//                   until it ends; link-aware carrier sense: a peer frame
+//   txSend()      - turnaround window after our last TX (or the last peer
+//                   frame received) still open -> hold until it ends;
+//                   link-aware carrier sense: a peer frame
 //                   arriving (or a received packet not yet read) ->
 //                   lbtDefer(); otherwise fskTx / flrcTx, ending in txKey()
 //   txKey()       - CAD gate off: SetTx. On: SetCadParams(exit mode TX) +
@@ -250,6 +251,17 @@ void LR2021Manager ::lbtTrackIrq(RadioSlot& r, U32 irq) {
     if ((irq & RX_END_IRQ_MASK) != 0) {
         // The frame is over: release the hold (unset time = passed).
         r.peerBusyUntil = Fw::Time();
+        if ((irq & LR20XX_SYSTEM_IRQ_RX_DONE) != 0) {
+            // A peer frame received: the peer may be mid-burst (a TC file
+            // upload sends its next frame one guard gap later). Leave it the
+            // turnaround window, as after our own TX, or a backlogged
+            // downlink keys up in that gap and the next frame is lost.
+            this->lbtTurnaround(r);
+            // A busy channel that delivers frames is the peer's burst, not a
+            // stuck one: start the count to a forced TX again, or a held frame
+            // is forced into the burst after LBT_MAX_ATTEMPTS peer frames.
+            r.txAttempts = 0;
+        }
         return;
     }
     const Fw::Time now = this->getTime();

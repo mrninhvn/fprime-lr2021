@@ -41,9 +41,16 @@ module LR2021 {
             BEACON @< Beacon frames framed by this component (beaconIn)
         }
 
-        @ Downlink route target: a radio index (0 or 1) or UART_RADIO (2, the
-        @ byte-stream / USB CDC target). Kept as a plain U8 (not an enum) so
-        @ the same wire value works whether NUM_RADIOS ever changes.
+        @ Downlink route target of RadioTxRoute. Values are the route-table
+        @ targets: radio index 0 / 1, UART_RADIO (2), SDR_RADIO (3) and
+        @ DISABLED_RADIO (4).
+        enum RouteTarget: U8 {
+            RADIO_0 = 0 @< Radio 0
+            RADIO_1 = 1 @< Radio 1
+            UART = 2 @< Byte-stream (UART / USB CDC) driver via drvSendOut
+            SDR = 3 @< The SDR via sdrOut
+            DISABLED = 4 @< Not sent: frames on this route are discarded
+        }
 
 
         # ----------------------------------------------------------------------
@@ -96,6 +103,21 @@ module LR2021 {
         @ (the thread stalled on a radio busy-wait) the bytes are dropped and
         @ the buffer freed instead of asserting.
         async input port drvReceiveIn: Drv.ByteStreamData hook
+
+        # ----------------------------------------------------------------------
+        # SDR downlink target
+        # ----------------------------------------------------------------------
+        # A fourth downlink target: frames routed to SDR_RADIO leave on sdrOut
+        # (FunctionalDeployment: CSP over RS422 to the SDR, which transmits them) and come
+        # back on sdrReturnIn once sent. A framer frame's comStatus credit is
+        # granted on its return, always SUCCESS: the link below reports its
+        # own failures, and a FAILURE would close the downlink of every route.
+
+        @ Downlink frame for the SDR; ownership passes until sdrReturnIn
+        output port sdrOut: Fw.BufferSend
+
+        @ Returns each sdrOut frame once it has been sent
+        async input port sdrReturnIn: Fw.BufferSend
 
         # ----------------------------------------------------------------------
         # Relay TX (uplink routing target)
@@ -180,12 +202,12 @@ module LR2021 {
         )
 
         @ Retarget a downlink source (events / telemetry / file) to a
-        @ different radio or the UART at runtime, without touching the other
-        @ two routes. Mirrors the topology's setTxRoute() call, callable from
+        @ different radio, the UART or the SDR at runtime, without touching the
+        @ other routes. Mirrors the topology's setTxRoute() call, callable from
         @ the ground. Takes effect on the next frame of that queue.
         async command RadioTxRoute(
             source: RouteQueue @< Downlink source to retarget (EVT / TLM / FILE / BEACON)
-            target: U8 @< Radio index (0 or 1), or 2 for UART
+            target: RouteTarget @< Radio 0 / 1, UART, SDR or DISABLED
         )
 
         @ Bench test: key a continuous PRBS9-modulated carrier (FSK or FLRC,
@@ -289,11 +311,11 @@ module LR2021 {
             format "Radio {} has no active mode; use SET_MODE first"
 
         @ Downlink route target changed at runtime
-        event RouteSet(source: RouteQueue, target: U8) severity activity high \
+        event RouteSet(source: RouteQueue, target: RouteTarget) severity activity high \
             format "Downlink route {} set to target {}"
 
-        @ SET_TX_ROUTE target out of range (not a valid radio index or UART)
-        event BadRouteTarget(target: U8) severity warning low \
+        @ RadioTxRoute target not available (SDR with sdrOut not connected)
+        event BadRouteTarget(target: RouteTarget) severity warning low \
             format "Invalid route target {}"
 
         @ RadioTxTest started: keying the PRBS9 test carrier

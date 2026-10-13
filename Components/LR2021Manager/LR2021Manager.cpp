@@ -190,8 +190,9 @@ void LR2021Manager ::setTxRoute(FwIndexType comQueueIndex, FwIndexType radioIdx)
     FW_ASSERT((comQueueIndex >= 0) && (comQueueIndex < TX_ROUTE_TABLE_SIZE),
               static_cast<FwAssertArgType>(comQueueIndex));
     // radioIdx in [0, NUM_RADIOS) selects a radio; UART_RADIO (== NUM_RADIOS)
-    // selects the byte-stream (UART) target.
-    FW_ASSERT((radioIdx >= 0) && (radioIdx <= UART_RADIO), static_cast<FwAssertArgType>(radioIdx));
+    // selects the byte-stream (UART) target, SDR_RADIO the sdrOut target,
+    // DISABLED_RADIO discards the frames.
+    FW_ASSERT((radioIdx >= 0) && (radioIdx <= DISABLED_RADIO), static_cast<FwAssertArgType>(radioIdx));
     this->m_txRoute[comQueueIndex] = radioIdx;
 }
 
@@ -587,6 +588,19 @@ void LR2021Manager ::dataIn_handler(FwIndexType portNum,
     // the byte-stream UART target).
     const FwIndexType idx = this->routeTx(context);
 
+    // Disabled route: discard the frame and grant the next credit so the other
+    // routes keep flowing. Silent, as it happens for every frame on the route.
+    if (idx == DISABLED_RADIO) {
+        if (this->isConnected_dataReturnOut_OutputPort(0)) {
+            this->dataReturnOut_out(0, data, context);
+        }
+        if (this->isConnected_comStatusOut_OutputPort(0)) {
+            Fw::Success success = Fw::Success::SUCCESS;
+            this->comStatusOut_out(0, success);
+        }
+        return;
+    }
+
     // A running BER test owns both of its radios: drop any downlink frame
     // routed to one of them so the raw test traffic is not corrupted.
     if (this->m_ber.active && ((idx == this->m_ber.txRadio) || (idx == this->m_ber.rxRadio))) {
@@ -622,6 +636,26 @@ void LR2021Manager ::dataIn_handler(FwIndexType portNum,
             this->comStatusOut_out(0, comSuccess);
         }
         this->m_comOpen = (comSuccess == Fw::Success::SUCCESS);
+        return;
+    }
+
+    // SDR target: hand the frame to sdrOut; it comes back on sdrReturnIn once
+    // sent, and only then is the next comStatus credit granted.
+    if (idx == SDR_RADIO) {
+        if (data.isValid() && this->isConnected_sdrOut_OutputPort(0)) {
+            this->stampTmFrame(data.getData(), data.getSize());
+            this->m_sdrContext = context;
+            this->sdrOut_out(0, data);
+            return;
+        }
+        this->log_WARNING_HI_TxFrameDropped(static_cast<U8>(idx));
+        if (this->isConnected_dataReturnOut_OutputPort(0)) {
+            this->dataReturnOut_out(0, data, context);
+        }
+        if (this->isConnected_comStatusOut_OutputPort(0)) {
+            Fw::Success success = Fw::Success::SUCCESS;
+            this->comStatusOut_out(0, success);
+        }
         return;
     }
 
@@ -685,6 +719,24 @@ void LR2021Manager ::dataReturnIn_handler(FwIndexType portNum,
     // buffer manager (our allocate port and the byte-stream driver's allocate
     // port point at it), so a plain deallocate returns them correctly.
     this->deallocate_out(0, data);
+}
+
+void LR2021Manager ::sdrReturnIn_handler(FwIndexType portNum, Fw::Buffer& fwBuffer) {
+    if (fwBuffer.getData() == this->m_beaconFrame) {
+        // Beacon frames live in m_beaconFrame: nothing to free, no credit.
+        this->m_beaconInFlight = false;
+        this->m_beaconTxCount++;
+        this->tlmWrite_BeaconTxCount(this->m_beaconTxCount);
+        this->serviceBeacon();
+        return;
+    }
+    if (this->isConnected_dataReturnOut_OutputPort(0)) {
+        this->dataReturnOut_out(0, fwBuffer, this->m_sdrContext);
+    }
+    if (this->isConnected_comStatusOut_OutputPort(0)) {
+        Fw::Success success = Fw::Success::SUCCESS;
+        this->comStatusOut_out(0, success);
+    }
 }
 
 void LR2021Manager ::drvConnected_handler(FwIndexType portNum) {
@@ -902,8 +954,12 @@ void LR2021Manager ::RadioSetPower_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U
 void LR2021Manager ::RadioTxRoute_cmdHandler(FwOpcodeType opCode,
                                              U32 cmdSeq,
                                              LR2021Manager_RouteQueue source,
-                                             U8 target) {
-    if (target > UART_RADIO) {
+                                             LR2021Manager_RouteTarget target) {
+    static_assert((LR2021Manager_RouteTarget::RADIO_0 == 0) && (LR2021Manager_RouteTarget::RADIO_1 == 1) &&
+                      (LR2021Manager_RouteTarget::UART == UART_RADIO) && (LR2021Manager_RouteTarget::SDR == SDR_RADIO) &&
+                      (LR2021Manager_RouteTarget::DISABLED == DISABLED_RADIO),
+                  "RouteTarget values must be the route-table targets");
+    if ((target == LR2021Manager_RouteTarget::SDR) && !this->isConnected_sdrOut_OutputPort(0)) {
         this->log_WARNING_LO_BadRouteTarget(target);
         this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
         return;
@@ -911,7 +967,7 @@ void LR2021Manager ::RadioTxRoute_cmdHandler(FwOpcodeType opCode,
     // RouteQueue values are defined to match the comQueueIndex the topology
     // assigns each ComQueue queue (EVT=0, TLM=1, FILE=2); see the .fpp comment.
     const FwIndexType queueIndex = static_cast<FwIndexType>(source.e);
-    this->setTxRoute(queueIndex, target);
+    this->setTxRoute(queueIndex, static_cast<FwIndexType>(target.e));
     this->log_ACTIVITY_HI_RouteSet(source, target);
     this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
 }

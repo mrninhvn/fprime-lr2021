@@ -296,7 +296,10 @@ constexpr uint32_t FSK_RX_CONTINUOUS = 0xFFFFFF;
 // the SDR ground station: TM lost under every TC). If the peer's preamble /
 // syncword arrives inside the window, link-aware sense holds TX until its
 // frame has been received. Size it above the peer's reaction time; it costs
-// downlink throughput only while there is a backlog.
+// downlink throughput only while there is a backlog. The same window opens
+// after each frame received from the peer, so a peer sending a burst (TC file
+// upload: next frame ~100 ms after the previous one, SDR ground guard) keeps
+// the channel until it pauses; the downlink waits instead of colliding.
 // ---------------------------------------------------------------------------
 
 // Channel-access attempts per frame before it is transmitted regardless.
