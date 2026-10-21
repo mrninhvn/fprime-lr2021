@@ -463,6 +463,15 @@ module LR2021 {
         @ Idle-channel RSSI of the FLRC radio, in dBm (as FskNoiseFloor)
         telemetry FlrcNoiseFloor: I16 update on change
 
+        @ Beacon field obcNicerfTemp: NiceRF module die temperature [whole deg C]
+        telemetry BeaconNicerfTemp: I8
+        @ Beacon field obcReyaxTemp: RY42F module die temperature [whole deg C]
+        telemetry BeaconReyaxTemp: I8
+        @ Beacon field obcFlrcRssi: last FLRC packet RSSI, dBm cast to I8
+        telemetry BeaconFlrcRssi: I8
+        @ Beacon field obcFskRssi: last FSK packet RSSI, dBm cast to I8
+        telemetry BeaconFskRssi: I8
+
         # ----------------------------------------------------------------------
         # Radio interface ports
         # ----------------------------------------------------------------------

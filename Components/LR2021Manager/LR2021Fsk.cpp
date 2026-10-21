@@ -616,6 +616,7 @@ void LR2021Manager ::fskService(RadioSlot& r) {
         this->m_fskRxCount++;
         this->tlmWrite_FskRxCount(this->m_fskRxCount);
         this->tlmWrite_FskRssi(pkt_status.rssi_sync_in_dbm);
+        this->tlmWrite_BeaconFskRssi(static_cast<I8>(pkt_status.rssi_sync_in_dbm));
         this->sendRssiPoly(Svc::PolyDbCfg::PolyDbEntry::POLYDB_ENTRY_OBC_FSK_RSSI, pkt_status.rssi_sync_in_dbm);
         // Per-packet event disabled: on the satellite every received TC (file upload) would add a
         // downlink event frame; FskRxCount / FskRssi carry the same information.

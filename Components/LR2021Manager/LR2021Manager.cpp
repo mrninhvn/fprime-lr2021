@@ -556,11 +556,17 @@ void LR2021Manager ::publishTempPoly(FwIndexType idx) {
         return;
     }
 
-    // Each module reports to its own PolyDb entry.
+    // Each module reports to its own beacon channel and PolyDb entry.
+    const bool nicerf = (this->m_radio[idx].moduleType == ModuleType::NICERF);
+    if (nicerf) {
+        this->tlmWrite_BeaconNicerfTemp(tempC);
+    } else {
+        this->tlmWrite_BeaconReyaxTemp(tempC);
+    }
+
     const Svc::PolyDbCfg::PolyDbEntry entry =
-        (this->m_radio[idx].moduleType == ModuleType::NICERF)
-            ? Svc::PolyDbCfg::PolyDbEntry::POLYDB_ENTRY_OBC_NICERF_Temperature
-            : Svc::PolyDbCfg::PolyDbEntry::POLYDB_ENTRY_OBC_REYAX_Temperature;
+        nicerf ? Svc::PolyDbCfg::PolyDbEntry::POLYDB_ENTRY_OBC_NICERF_Temperature
+               : Svc::PolyDbCfg::PolyDbEntry::POLYDB_ENTRY_OBC_REYAX_Temperature;
 
     Svc::MeasurementStatus polyStatus = Svc::MeasurementStatus::OK;
     Fw::Time polyTime = this->getTime();
