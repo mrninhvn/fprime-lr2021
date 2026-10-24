@@ -191,7 +191,7 @@ void LR2021Manager ::setTxRoute(FwIndexType comQueueIndex, FwIndexType radioIdx)
               static_cast<FwAssertArgType>(comQueueIndex));
     // radioIdx in [0, NUM_RADIOS) selects a radio; UART_RADIO (== NUM_RADIOS)
     // selects the byte-stream (UART) target, SDR_RADIO the sdrOut target,
-    // DISABLED_RADIO discards the frames.
+    // HOST_RADIO the hostOut target, DISABLED_RADIO discards the frames.
     FW_ASSERT((radioIdx >= 0) && (radioIdx <= DISABLED_RADIO), static_cast<FwAssertArgType>(radioIdx));
     this->m_txRoute[comQueueIndex] = radioIdx;
 }
@@ -645,13 +645,20 @@ void LR2021Manager ::dataIn_handler(FwIndexType portNum,
         return;
     }
 
-    // SDR target: hand the frame to sdrOut; it comes back on sdrReturnIn once
-    // sent, and only then is the next comStatus credit granted.
-    if (idx == SDR_RADIO) {
-        if (data.isValid() && this->isConnected_sdrOut_OutputPort(0)) {
+    // SDR / host target: hand the frame to sdrOut / hostOut; it comes back on
+    // sdrReturnIn / hostReturnIn, and only then is the next comStatus credit granted.
+    if ((idx == SDR_RADIO) || (idx == HOST_RADIO)) {
+        const bool host = (idx == HOST_RADIO);
+        const bool connected = host ? this->isConnected_hostOut_OutputPort(0) : this->isConnected_sdrOut_OutputPort(0);
+        if (data.isValid() && connected) {
             this->stampTmFrame(data.getData(), data.getSize());
-            this->m_sdrContext = context;
-            this->sdrOut_out(0, data);
+            if (host) {
+                this->m_hostContext = context;
+                this->hostOut_out(0, data);
+            } else {
+                this->m_sdrContext = context;
+                this->sdrOut_out(0, data);
+            }
             return;
         }
         this->log_WARNING_HI_TxFrameDropped(static_cast<U8>(idx));
@@ -728,6 +735,14 @@ void LR2021Manager ::dataReturnIn_handler(FwIndexType portNum,
 }
 
 void LR2021Manager ::sdrReturnIn_handler(FwIndexType portNum, Fw::Buffer& fwBuffer) {
+    this->extFrameReturn(fwBuffer, this->m_sdrContext);
+}
+
+void LR2021Manager ::hostReturnIn_handler(FwIndexType portNum, Fw::Buffer& fwBuffer) {
+    this->extFrameReturn(fwBuffer, this->m_hostContext);
+}
+
+void LR2021Manager ::extFrameReturn(Fw::Buffer& fwBuffer, const ComCfg::FrameContext& context) {
     if (fwBuffer.getData() == this->m_beaconFrame) {
         // Beacon frames live in m_beaconFrame: nothing to free, no credit.
         this->m_beaconInFlight = false;
@@ -737,7 +752,7 @@ void LR2021Manager ::sdrReturnIn_handler(FwIndexType portNum, Fw::Buffer& fwBuff
         return;
     }
     if (this->isConnected_dataReturnOut_OutputPort(0)) {
-        this->dataReturnOut_out(0, fwBuffer, this->m_sdrContext);
+        this->dataReturnOut_out(0, fwBuffer, context);
     }
     if (this->isConnected_comStatusOut_OutputPort(0)) {
         Fw::Success success = Fw::Success::SUCCESS;
@@ -963,9 +978,11 @@ void LR2021Manager ::RadioTxRoute_cmdHandler(FwOpcodeType opCode,
                                              LR2021Manager_RouteTarget target) {
     static_assert((LR2021Manager_RouteTarget::RADIO_0 == 0) && (LR2021Manager_RouteTarget::RADIO_1 == 1) &&
                       (LR2021Manager_RouteTarget::UART == UART_RADIO) && (LR2021Manager_RouteTarget::SDR == SDR_RADIO) &&
+                      (LR2021Manager_RouteTarget::HOST == HOST_RADIO) &&
                       (LR2021Manager_RouteTarget::DISABLED == DISABLED_RADIO),
                   "RouteTarget values must be the route-table targets");
-    if ((target == LR2021Manager_RouteTarget::SDR) && !this->isConnected_sdrOut_OutputPort(0)) {
+    if (((target == LR2021Manager_RouteTarget::SDR) && !this->isConnected_sdrOut_OutputPort(0)) ||
+        ((target == LR2021Manager_RouteTarget::HOST) && !this->isConnected_hostOut_OutputPort(0))) {
         this->log_WARNING_LO_BadRouteTarget(target);
         this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
         return;

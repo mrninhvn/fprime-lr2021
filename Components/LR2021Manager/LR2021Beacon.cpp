@@ -207,10 +207,11 @@ void LR2021Manager ::serviceBeacon() {
         return;
     }
 
-    if (idx == SDR_RADIO) {
-        // m_beaconFrame is out on sdrOut until sdrReturnIn hands it back
+    if ((idx == SDR_RADIO) || (idx == HOST_RADIO)) {
+        // m_beaconFrame is out on sdrOut / hostOut until sdrReturnIn / hostReturnIn hands it back
+        const bool host = (idx == HOST_RADIO);
         this->m_beaconPending = false;
-        if (!this->isConnected_sdrOut_OutputPort(0)) {
+        if (host ? !this->isConnected_hostOut_OutputPort(0) : !this->isConnected_sdrOut_OutputPort(0)) {
             this->beaconDropped(idx);
             return;
         }
@@ -218,7 +219,11 @@ void LR2021Manager ::serviceBeacon() {
         this->stampTmFrame(this->m_beaconFrame, this->m_tmFrameSize);
         this->m_beaconInFlight = true;
         Fw::Buffer frame(this->m_beaconFrame, this->m_tmFrameSize);
-        this->sdrOut_out(0, frame);
+        if (host) {
+            this->hostOut_out(0, frame);
+        } else {
+            this->sdrOut_out(0, frame);
+        }
         return;
     }
 

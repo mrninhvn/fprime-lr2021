@@ -42,14 +42,15 @@ module LR2021 {
         }
 
         @ Downlink route target of RadioTxRoute. Values are the route-table
-        @ targets: radio index 0 / 1, UART_RADIO (2), SDR_RADIO (3) and
-        @ DISABLED_RADIO (4).
+        @ targets: radio index 0 / 1, UART_RADIO (2), SDR_RADIO (3),
+        @ HOST_RADIO (4) and DISABLED_RADIO (5).
         enum RouteTarget: U8 {
             RADIO_0 = 0 @< Radio 0
             RADIO_1 = 1 @< Radio 1
             UART = 2 @< Byte-stream (UART / USB CDC) driver via drvSendOut
             SDR = 3 @< The SDR via sdrOut
-            DISABLED = 4 @< Not sent: frames on this route are discarded
+            HOST = 4 @< The host OBC via hostOut (it transmits them on its own radio)
+            DISABLED = 5 @< Not sent: frames on this route are discarded
         }
 
 
@@ -118,6 +119,20 @@ module LR2021 {
 
         @ Returns each sdrOut frame once it has been sent
         async input port sdrReturnIn: Fw.BufferSend
+
+        # ----------------------------------------------------------------------
+        # Host OBC downlink target
+        # ----------------------------------------------------------------------
+        # A fifth downlink target, handled like SDR_RADIO: frames routed to
+        # HOST_RADIO leave on hostOut (TlmBeaconDeployment: HostLink, CSP to the
+        # host OBC, which transmits them) and come back on hostReturnIn once the
+        # host has answered for them.
+
+        @ Downlink frame for the host OBC; ownership passes until hostReturnIn
+        output port hostOut: Fw.BufferSend
+
+        @ Returns each hostOut frame once the host has answered for it
+        async input port hostReturnIn: Fw.BufferSend
 
         # ----------------------------------------------------------------------
         # Relay TX (uplink routing target)
@@ -202,12 +217,12 @@ module LR2021 {
         )
 
         @ Retarget a downlink source (events / telemetry / file) to a
-        @ different radio, the UART or the SDR at runtime, without touching the
+        @ different radio, the UART, the SDR or the host OBC at runtime, without touching the
         @ other routes. Mirrors the topology's setTxRoute() call, callable from
         @ the ground. Takes effect on the next frame of that queue.
         async command RadioTxRoute(
             source: RouteQueue @< Downlink source to retarget (EVT / TLM / FILE / BEACON)
-            target: RouteTarget @< Radio 0 / 1, UART, SDR or DISABLED
+            target: RouteTarget @< Radio 0 / 1, UART, SDR, HOST or DISABLED
         )
 
         @ Bench test: key a continuous PRBS9-modulated carrier (FSK or FLRC,
@@ -314,7 +329,7 @@ module LR2021 {
         event RouteSet(source: RouteQueue, target: RouteTarget) severity activity high \
             format "Downlink route {} set to target {}"
 
-        @ RadioTxRoute target not available (SDR with sdrOut not connected)
+        @ RadioTxRoute target not available (SDR / HOST with sdrOut / hostOut not connected)
         event BadRouteTarget(target: RouteTarget) severity warning low \
             format "Invalid route target {}"
 

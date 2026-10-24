@@ -57,8 +57,11 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Route-table target meaning "send out sdrOut (the SDR)". One past UART.
     static constexpr FwIndexType SDR_RADIO = UART_RADIO + 1;
 
-    //! Route-table target meaning "do not send": frames are discarded. One past SDR.
-    static constexpr FwIndexType DISABLED_RADIO = SDR_RADIO + 1;
+    //! Route-table target meaning "send out hostOut (the host OBC)". One past SDR.
+    static constexpr FwIndexType HOST_RADIO = SDR_RADIO + 1;
+
+    //! Route-table target meaning "do not send": frames are discarded. One past HOST.
+    static constexpr FwIndexType DISABLED_RADIO = HOST_RADIO + 1;
 
     //! Number of synchronous send retries on the byte-stream driver.
     static constexpr FwIndexType UART_RETRY_LIMIT = 3;
@@ -538,6 +541,14 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! framer with a SUCCESS credit.
     void sdrReturnIn_handler(FwIndexType portNum, Fw::Buffer& fwBuffer) override;
 
+    //! Handler implementation for hostReturnIn: a hostOut frame has been
+    //! answered for by the host. Same handling as sdrReturnIn.
+    void hostReturnIn_handler(FwIndexType portNum, Fw::Buffer& fwBuffer) override;
+
+    //! An sdrOut / hostOut frame is back: free the beacon slot, or return a
+    //! framer frame (with its context) and grant a SUCCESS credit.
+    void extFrameReturn(Fw::Buffer& fwBuffer, const ComCfg::FrameContext& context);
+
     //! Handler implementation for beaconIn: copy the beacon packet, return
     //! the buffer, and send it as a TM frame when its route target is free.
     void beaconIn_handler(FwIndexType portNum, Fw::Buffer& fwBuffer) override;
@@ -614,7 +625,7 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     void RadioTxRoute_cmdHandler(FwOpcodeType opCode,             //!< The opcode
                                  U32 cmdSeq,                      //!< The command sequence number
                                  LR2021Manager_RouteQueue source,  //!< Downlink source to retarget
-                                 LR2021Manager_RouteTarget target  //!< Radio 0 / 1, UART, SDR or DISABLED
+                                 LR2021Manager_RouteTarget target  //!< Radio 0 / 1, UART, SDR, HOST or DISABLED
                                  ) override;
 
     //! Handler implementation for command RadioTxTest
@@ -791,6 +802,7 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     RxSink m_rxSink = RxSink::DATA_OUT;                 //!< Destination for received packets
     bool m_comOpen = false;         //!< Initial comStatus READY emitted / flow open
     ComCfg::FrameContext m_sdrContext;  //!< Context of the framer frame out on sdrOut (one credit, one frame)
+    ComCfg::FrameContext m_hostContext;  //!< Context of the framer frame out on hostOut (one credit, one frame)
     U32 m_txCount = 0;              //!< FLRC packets transmitted (all radios)
     U32 m_rxCount = 0;              //!< FLRC packets received (all radios)
     U32 m_fskTxCount = 0;           //!< FSK packets transmitted (all radios)
@@ -810,7 +822,7 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     U8 m_beaconPacket[TM_FRAME_MAX_SIZE];  //!< Pending beacon packet (descriptor + data)
     U16 m_beaconPacketLen = 0;      //!< Its length
     bool m_beaconPending = false;   //!< m_beaconPacket waits for its turn
-    bool m_beaconInFlight = false;  //!< m_beaconFrame is in use by a radio slot or sdrOut
+    bool m_beaconInFlight = false;  //!< m_beaconFrame is in use by a radio slot, sdrOut or hostOut
     U8 m_beaconFrame[TM_FRAME_MAX_SIZE];   //!< Beacon TM frame being sent
     U16 m_beaconApid[BEACON_APID_SLOTS] = {0};  //!< APIDs seen on beaconIn
     U16 m_beaconSeq[BEACON_APID_SLOTS] = {0};   //!< Next sequence count per APID
