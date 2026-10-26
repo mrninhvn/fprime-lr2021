@@ -976,7 +976,7 @@ void LR2021Manager ::RadioTxRoute_cmdHandler(FwOpcodeType opCode,
                                              U32 cmdSeq,
                                              LR2021Manager_RouteQueue source,
                                              LR2021Manager_RouteTarget target) {
-    static_assert((LR2021Manager_RouteTarget::RADIO_0 == 0) && (LR2021Manager_RouteTarget::RADIO_1 == 1) &&
+    static_assert((LR2021Manager_RouteTarget::UHF == 0) && (LR2021Manager_RouteTarget::S_BAND == 1) &&
                       (LR2021Manager_RouteTarget::UART == UART_RADIO) && (LR2021Manager_RouteTarget::SDR == SDR_RADIO) &&
                       (LR2021Manager_RouteTarget::HOST == HOST_RADIO) &&
                       (LR2021Manager_RouteTarget::DISABLED == DISABLED_RADIO),

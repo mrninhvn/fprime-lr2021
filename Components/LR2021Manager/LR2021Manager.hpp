@@ -625,7 +625,7 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     void RadioTxRoute_cmdHandler(FwOpcodeType opCode,             //!< The opcode
                                  U32 cmdSeq,                      //!< The command sequence number
                                  LR2021Manager_RouteQueue source,  //!< Downlink source to retarget
-                                 LR2021Manager_RouteTarget target  //!< Radio 0 / 1, UART, SDR, HOST or DISABLED
+                                 LR2021Manager_RouteTarget target  //!< UHF, S_BAND, UART, SDR, HOST or DISABLED
                                  ) override;
 
     //! Handler implementation for command RadioTxTest

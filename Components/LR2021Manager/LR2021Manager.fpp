@@ -42,11 +42,11 @@ module LR2021 {
         }
 
         @ Downlink route target of RadioTxRoute. Values are the route-table
-        @ targets: radio index 0 / 1, UART_RADIO (2), SDR_RADIO (3),
+        @ targets: radio index 0 (UHF) / 1 (S_BAND), UART_RADIO (2), SDR_RADIO (3),
         @ HOST_RADIO (4) and DISABLED_RADIO (5).
         enum RouteTarget: U8 {
-            RADIO_0 = 0 @< Radio 0
-            RADIO_1 = 1 @< Radio 1
+            UHF = 0 @< Radio 0 (UHF)
+            S_BAND = 1 @< Radio 1 (S-band)
             UART = 2 @< Byte-stream (UART / USB CDC) driver via drvSendOut
             SDR = 3 @< The SDR via sdrOut
             HOST = 4 @< The host OBC via hostOut (it transmits them on its own radio)
@@ -222,7 +222,7 @@ module LR2021 {
         @ the ground. Takes effect on the next frame of that queue.
         async command RadioTxRoute(
             source: RouteQueue @< Downlink source to retarget (EVT / TLM / FILE / BEACON)
-            target: RouteTarget @< Radio 0 / 1, UART, SDR, HOST or DISABLED
+            target: RouteTarget @< UHF, S_BAND, UART, SDR, HOST or DISABLED
         )
 
         @ Bench test: key a continuous PRBS9-modulated carrier (FSK or FLRC,
