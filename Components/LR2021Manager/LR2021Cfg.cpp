@@ -5,16 +5,21 @@
 //         built on the lr20xx_driver C API.
 //
 // Flow:
-//   radioInit(idx) - reset, regulator, clocks, DIO / RF-switch map for the
-//                    module type populated on that radio slot
+//   radioInit(idx) - reset, patch RAM, regulator, clocks, calibration, DIO /
+//                    RF-switch map for the module type populated on that
+//                    radio slot, 1024-byte FIFOs (order of USP v1.2.1
+//                    ral_lr20xx_init)
 // ======================================================================
 
 #include "Components/LR2021Manager/LR2021Manager.hpp"
 #include "Components/LR2021Manager/LR2021Cfg.hpp"
 
 extern "C" {
+#include "lr20xx_patch.h"
+#include "lr20xx_pram_load.h"
 #include "lr20xx_system.h"
 #include "lr20xx_radio_common.h"
+#include "lr20xx_radio_fifo.h"
 }
 
 namespace LR2021 {
@@ -34,6 +39,26 @@ bool LR2021Manager ::radioInit(FwIndexType idx) {
     if (status != LR20XX_STATUS_OK) {
         DEBUG("radio %d reset failed (%d)", static_cast<int>(idx), status);
         return false;
+    }
+
+    // Patch RAM. Since lr20xx_driver v2.0 the chip limitations (among them
+    // the DC-DC sub-GHz sensitivity fix the driver used to apply as a
+    // workaround) are fixed by the PRAM, which must be loaded after every
+    // reset (and after a sleep without retention, not used here).
+    status = lr20xx_pram_load_pram_lr2021(&r);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("radio %d PRAM load failed (%d)", static_cast<int>(idx), status);
+        return false;
+    }
+    lr20xx_patch_version_t pram = {false, 0, 0};
+    if (lr20xx_patch_get_version(&r, &pram) == LR20XX_STATUS_OK) {
+        Fw::LogStringArg msg;
+        if (pram.is_pram_loaded) {
+            msg.format("radio %d PRAM type %X v%X", static_cast<int>(idx), pram.pram_type, pram.pram_version);
+        } else {
+            msg.format("radio %d PRAM not loaded", static_cast<int>(idx));
+        }
+        this->log_DIAGNOSTIC_LR2021(msg);
     }
 
     // System configuration mirroring the validated USP overlay for these
@@ -80,11 +105,32 @@ bool LR2021Manager ::radioInit(FwIndexType idx) {
     // Calibrate the Measure Unit ADC. Without this one-time boot calibration
     // the ADC-backed measurements (GetTemp / GetVbat) return 0. Per the driver
     // docstring this "should be executed at boot" and, for the MU block,
-    // "initial calibration is enough". Calibrate returns the chip to STDBY_RC.
-    status = lr20xx_system_calibrate(&r, LR20XX_SYSTEM_CALIB_MU_MASK);
+    // "initial calibration is enough". On the TCXO module the RC clocks, PLL,
+    // AAF and PA offset are recalibrated too, once the TCXO runs (USP v1.2.1
+    // fix "calibrate after configuring tcxo", mask 0x6F). Calibrate returns
+    // the chip to STDBY_RC.
+    const lr20xx_system_calibration_mask_t calib_mask =
+        (r.moduleType == ModuleType::NICERF)
+            ? static_cast<lr20xx_system_calibration_mask_t>(
+                  LR20XX_SYSTEM_CALIB_LF_RC_MASK | LR20XX_SYSTEM_CALIB_HF_RC_MASK | LR20XX_SYSTEM_CALIB_PLL_MASK |
+                  LR20XX_SYSTEM_CALIB_AAF_MASK | LR20XX_SYSTEM_CALIB_MU_MASK | LR20XX_SYSTEM_CALIB_PA_OFF_MASK)
+            : static_cast<lr20xx_system_calibration_mask_t>(LR20XX_SYSTEM_CALIB_MU_MASK);
+    status = lr20xx_system_calibrate(&r, calib_mask);
     if (status != LR20XX_STATUS_OK) {
-        DEBUG("calibrate (MU ADC) failed (%d)", status);
+        DEBUG("calibrate (0x%X) failed (%d)", calib_mask, status);
         return false;
+    }
+    // The calibration holds BUSY while the TCXO starts (~61 ms window) and
+    // the blocks calibrate; give it the same margin as a cold XOSC entry.
+    if (!this->waitOnBusy(idx, 2500000)) {
+        DEBUG("radio %d BUSY stuck after calibrate", static_cast<int>(idx));
+        return false;
+    }
+    errors = 0;
+    if ((lr20xx_system_get_errors(&r, &errors) == LR20XX_STATUS_OK) && (errors != 0)) {
+        DEBUG("radio %d errors after calibrate: 0x%X (cleared)", static_cast<int>(idx),
+              static_cast<unsigned>(errors));
+        (void)lr20xx_system_clear_errors(&r);
     }
 
     // DIO routing is MODULE-specific (each module wires its RF switch tree
@@ -162,6 +208,20 @@ bool LR2021Manager ::radioInit(FwIndexType idx) {
     // (bench-verified with the block removed); the chip handles the needed
     // calibration when RF operations start. Revisit during RX sensitivity
     // characterisation.
+
+    // 1024-byte TX / RX FIFOs (1020 / 1000 B usable) instead of the default
+    // 256-byte ones, as USP v1.2.1 ral_lr20xx_init does: two register writes
+    // each, valid with the patch RAM loaded above. Kept until reset or sleep
+    // (no sleep here, so no retention slots). The FLRC burst needs it to
+    // hold the next frame behind the one on the air.
+    status = lr20xx_radio_fifo_configure_1024_byte_tx_fifo(&r);
+    if (status == LR20XX_STATUS_OK) {
+        status = lr20xx_radio_fifo_configure_1024_byte_rx_fifo(&r);
+    }
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("radio %d 1024-byte FIFO cfg failed (%d)", static_cast<int>(idx), status);
+        return false;
+    }
 
     DEBUG("radio %d init OK", static_cast<int>(idx));
     return true;

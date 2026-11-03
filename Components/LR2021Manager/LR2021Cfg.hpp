@@ -24,6 +24,47 @@ extern "C" {
 #define FLRC_CR LR20XX_RADIO_FLRC_CR_3_4
 #endif
 
+// FLRC burst: 1 = while a framer frame is on the air the next one is written
+// into the (1024-byte) TX FIFO behind it and keyed on TX_DONE (no credit
+// round trip, no RX re-arm between frames; the radio returns to RX when no
+// frame is waiting). 0 = one frame per credit with an RX re-arm
+// after each TX, as before the burst (the fallback below reverts too).
+#ifndef LR2021_FLRC_BURST
+#define LR2021_FLRC_BURST 1
+#endif
+
+// FLRC burst: minimum time from handling TX_DONE to keying the next frame,
+// in us (a spin; the key itself is only set_tx). With the 272 us ramp, 0
+// gives a ~700 us interframe (last bit -> first bit, Semtech's pairing for
+// 272 us) but the chip still started modulating ~29 us before the PA ramp
+// at 2.08 Mb/s (preamble bits 0-33 corrupt, ground SDR 61/4 sync lost
+// 7.7%); 100 us (~800 us interframe): preamble clean, header after the
+// ramp, 0 lost of 22835 frames at 2.08 Mb/s (IQ + comtest, 2026-11-03).
+#ifndef LR2021_FLRC_BURST_KEY_DELAY_US
+#define LR2021_FLRC_BURST_KEY_DELAY_US 100
+#endif
+
+// FLRC PA ramp time. Burst: 272 us, Semtech's FLRP default for CR 3/4
+// (paired with a >= 700 us interframe); 128 us left the preamble of the
+// frames keyed inside a burst unusable (~50% bit errors, ~35 us; the ground
+// SDR 61/4 sync template lost 29% at 1.04 Mb/s, 0 with 272 us). No burst:
+// 128 us (Semtech minimum at 2.4 GHz), 1000/1000 at all 8 rates; 96 us lost
+// preambles (2.6 Mb/s: 35% with the full-header SDR sync).
+#ifndef LR2021_FLRC_PA_RAMP
+#if LR2021_FLRC_BURST
+#define LR2021_FLRC_PA_RAMP LR20XX_RADIO_COMMON_RAMP_272_US
+#else
+#define LR2021_FLRC_PA_RAMP LR20XX_RADIO_COMMON_RAMP_128_US
+#endif
+#endif
+
+// FLRC fallback after TX / RX: 1 = FS (synthesizer stays locked; set_fs
+// before each first key, STDBY_XOSC again before re-arming RX), 0 =
+// STDBY_XOSC. The burst was validated with FS.
+#ifndef LR2021_FLRC_FALLBACK_FS
+#define LR2021_FLRC_FALLBACK_FS LR2021_FLRC_BURST
+#endif
+
 #ifndef FLRC_PULSE_SHAPE
 #define FLRC_PULSE_SHAPE LR20XX_RADIO_FLRC_PULSE_SHAPE_BT_05
 #endif
@@ -49,6 +90,8 @@ extern "C" {
 #endif
 
 #ifndef FLRC_CRC
+// The 2-byte radio CRC corrupted the last payload byte with lr20xx_driver
+// 1.3.4 and no patch RAM; not yet re-tested with the PRAM (USP v1.2.1).
 // #define FLRC_CRC LR20XX_RADIO_FLRC_CRC_2_BYTES
 #define FLRC_CRC LR20XX_RADIO_FLRC_CRC_OFF
 #endif

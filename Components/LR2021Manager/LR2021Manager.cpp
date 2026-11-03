@@ -297,6 +297,7 @@ bool LR2021Manager ::setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 po
     if (r.workingBuffer.isValid()) {
         this->txComplete(r, Fw::Success::FAILURE);
     }
+    this->burstAbort(r);
     r.txInFlight = false;
     r.txHeld = false;
     r.cadListening = false;
@@ -382,6 +383,7 @@ bool LR2021Manager ::txTest(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 pow
     if (r.workingBuffer.isValid()) {
         this->txComplete(r, Fw::Success::FAILURE);
     }
+    this->burstAbort(r);
     r.txInFlight = false;
     r.txHeld = false;
     r.cadListening = false;
@@ -479,13 +481,7 @@ void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
         this->lbtRun(r);
 
         // A framer frame held back by a beacon: send it once the slot is free.
-        if (r.pendingFramer.isValid() && !r.workingBuffer.isValid() && !r.txInFlight) {
-            Fw::Buffer frame = r.pendingFramer;
-            const ComCfg::FrameContext frameContext = r.pendingFramerContext;
-            r.pendingFramer = Fw::Buffer();
-            r.pendingFramerContext = ComCfg::FrameContext();
-            this->startFramerTx(i, frame, frameContext);
-        }
+        this->startPendingFramer(i);
     }
 
     // Pending beacon: on the air as soon as its route target is free.
@@ -495,6 +491,47 @@ void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
     // service above already cleared txInFlight / tallied any RX_DONE this
     // tick, so berDrive() can send the next packet or finalize now.
     this->berDrive();
+}
+
+void LR2021Manager ::startPendingFramer(FwIndexType idx) {
+    RadioSlot& r = this->m_radio[idx];
+    if (r.pendingFramer.isValid() && !r.workingBuffer.isValid() && !r.txInFlight) {
+        Fw::Buffer frame = r.pendingFramer;
+        const ComCfg::FrameContext frameContext = r.pendingFramerContext;
+        r.pendingFramer = Fw::Buffer();
+        r.pendingFramerContext = ComCfg::FrameContext();
+        this->startFramerTx(idx, frame, frameContext);
+    }
+}
+
+void LR2021Manager ::irqIn_handler(FwIndexType portNum, Os::RawTime& cycleStart) {
+    FW_ASSERT((portNum >= 0) && (portNum < NUM_RADIOS), static_cast<FwAssertArgType>(portNum));
+    RadioSlot& r = this->m_radio[portNum];
+    // A timed TX test owns the slot until run() restores it.
+    if (r.txTesting) {
+        return;
+    }
+    // Same IRQ service as run(): a TX_DONE returns the frame and grants the
+    // next comStatus credit right away, so the next frame (async dataIn)
+    // goes on the air without waiting for the next tick. LBT timers, noise
+    // sampling and the BER test stay on run().
+    switch (r.mode) {
+        case RadioMode::FLRC:
+            this->flrcService(r);
+            break;
+        case RadioMode::FSK:
+            this->fskService(r);
+            break;
+        default:
+            break;
+    }
+    // The slot may have been freed by a beacon's TX_DONE.
+    this->startPendingFramer(portNum);
+    this->serviceBeacon();
+}
+
+void LR2021Manager ::pingIn_handler(FwIndexType portNum, U32 key) {
+    this->pingOut_out(portNum, key);
 }
 
 // ----------------------------------------------------------------------
@@ -547,14 +584,27 @@ void LR2021Manager ::publishTempPoly(FwIndexType idx) {
         return;
     }
 
+    // At most one read per TEMP_PUBLISH_PERIOD_US: called on every TX->RX
+    // turnaround, where a per-frame conversion costs S-band throughput.
+    RadioSlot& r = this->m_radio[idx];
+    Os::RawTime now;
+    (void)now.now();
+    U32 sinceUs = 0;
+    if (r.tempReadDone && (now.getDiffUsec(r.tempReadTime, sinceUs) == Os::RawTime::OP_OK) &&
+        (sinceUs < TEMP_PUBLISH_PERIOD_US)) {
+        return;
+    }
+
     // Read the die temperature. The caller must invoke this only while the
     // radio is in STDBY_XOSC (the MU ADC does not convert during TX/RX): that
     // is the case on the TX->RX turnaround, inside fskRx()/flrcRx() after the
     // set_standby(XOSC) step and before set_rx.
     I8 tempC = 0;
     if (!this->readDieTemp(idx, tempC)) {
-        return;
+        return;  // no valid conversion: retry on the next turnaround
     }
+    r.tempReadTime = now;
+    r.tempReadDone = true;
 
     // Each module reports to its own beacon channel and PolyDb entry.
     const bool nicerf = (this->m_radio[idx].moduleType == ModuleType::NICERF);
@@ -689,6 +739,12 @@ void LR2021Manager ::dataIn_handler(FwIndexType portNum,
 void LR2021Manager ::startFramerTx(FwIndexType idx, Fw::Buffer& data, const ComCfg::FrameContext& context) {
     RadioSlot& r = this->m_radio[idx];
 
+    // FLRC burst: a burst frame is on the air (its credit already returned),
+    // so this one waits in RAM and is keyed on that frame's TX_DONE.
+    if (this->burstStage(r, data, context)) {
+        return;
+    }
+
     // The framer stack sends one frame per comStatus credit, so the routed
     // radio is normally idle here; any local failure drops the frame. A busy
     // channel is not a failure: txSend() holds the frame for a backoff and
@@ -708,6 +764,8 @@ void LR2021Manager ::startFramerTx(FwIndexType idx, Fw::Buffer& data, const ComC
             r.workingBuffer = Fw::Buffer();
             r.workingContext = ComCfg::FrameContext();
             r.txHeld = false;
+        } else if (r.txInFlight && !r.cadListening) {
+            this->burstStart(r);
         }
     }
     if (!ok) {

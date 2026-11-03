@@ -497,6 +497,10 @@ module LR2021 {
         @ operation (busy-wait) blocks the thread; missing one is harmless.
         async input port run: Svc.Sched drop
 
+        @ Use this port for Health
+        async input port pingIn: Svc.Ping
+        output port pingOut: Svc.Ping
+
         # Hardware port arrays: index = radio index (0 / 1), each element
         # wired to that module's SPI chip-select / GPIO driver.
 
@@ -516,6 +520,13 @@ module LR2021 {
         @ poll when no IRQ is pending. Optional: when unconnected the
         @ component polls IRQ status over SPI every run tick.
         output port irqGpioRead: [2] Drv.GpioRead
+
+        @ IRQ line rising edge (index = radio), from an interrupt GPIO driver:
+        @ services that radio at once instead of at the next run tick, so a
+        @ TX_DONE frees the downlink for the next frame without waiting up to
+        @ one tick. Optional: run() keeps polling as a fallback. Drop on
+        @ overflow: a lost edge is caught by the next run tick.
+        async input port irqIn: [2] Svc.Cycle drop
 
         # ----------------------------------------------------------------------
         # Standard AC Ports: Required for Channels, Events, Commands, Parameters

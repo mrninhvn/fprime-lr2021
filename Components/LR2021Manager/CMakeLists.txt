@@ -11,8 +11,11 @@ set(LR20XX_DRIVER
 
 # Core driver sources plus the commonly used LoRa / FSK modulation drivers.
 # Add more lr20xx_radio_*.c files here to enable other modulations.
+# lr20xx_patch.c / lr20xx_pram_load.c load the LR2021 patch RAM at init (driver v2.0+).
 set(lr20xx_src
     "${LR20XX_DRIVER}/src/lr20xx_driver_version.c"
+    "${LR20XX_DRIVER}/src/lr20xx_patch.c"
+    "${LR20XX_DRIVER}/src/lr20xx_pram_load.c"
     "${LR20XX_DRIVER}/src/lr20xx_radio_common.c"
     "${LR20XX_DRIVER}/src/lr20xx_radio_fifo.c"
     "${LR20XX_DRIVER}/src/lr20xx_regmem.c"

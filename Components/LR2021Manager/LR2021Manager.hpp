@@ -17,6 +17,7 @@
 #include "Components/LR2021Manager/LR2021ManagerComponentAc.hpp"
 
 #include <Fw/Types/BasicTypes.hpp>
+#include <Os/RawTime.hpp>
 #include <Os/Task.hpp>
 #include <Os/Console.hpp>
 #include <Fw/Types/String.hpp>
@@ -43,6 +44,19 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Maximum size of a single SPI transaction issued by the HAL, in bytes.
     //! Large enough for a command header plus a full 256-byte FIFO transfer.
     static constexpr FwSizeType HAL_BUFFER_SIZE = 512;
+
+    //! Chip TX FIFO capacity: the 1024-byte FIFO set up in radioInit holds
+    //! 1020 bytes (the default 256-byte one saturated at 255 on FW 0x18).
+    static constexpr FwSizeType TX_FIFO_SIZE = 1020;
+
+    //! Largest FLRC burst frame: the frame on the air and the staged one
+    //! must fit in the TX FIFO together.
+    static constexpr FwSizeType BURST_FRAME_MAX = TX_FIFO_SIZE / 2;
+
+    //! Minimum interval between die-temperature reads of a radio. The read
+    //! (MU ADC conversion, ~210 us) sits on the TX->RX turnaround of every
+    //! frame, so it is rate-limited instead of done per frame.
+    static constexpr U32 TEMP_PUBLISH_PERIOD_US = 1000000;
 
     //! Default time to wait for the BUSY line to go low, in microseconds.
     static constexpr U32 BUSY_TIMEOUT_US = 100000;
@@ -129,6 +143,8 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
         U32 txFreqHz = 0;    //!< TX frequency override; 0 = use freqHz
         U32 rxFreqHz = 0;    //!< RX frequency override; 0 = use freqHz
         U32 progFreqHz = 0;  //!< RF frequency currently programmed on the chip
+        Os::RawTime tempReadTime;  //!< Time of the last die-temperature read
+        bool tempReadDone = false;  //!< tempReadTime is valid
         I8 powerDbm = 0;     //!< TX power of the last setMode()
         bool rxContinuous = false;  //!< Re-enter RX automatically after each packet
         bool txInFlight = false;    //!< TX (or CAD-LBT + TX) started, not yet finished
@@ -141,6 +157,14 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
         Fw::Buffer pendingFramer;   //!< Framer frame that arrived while this slot sent a
                                     //!< beacon: sent by run() once the slot is free
         ComCfg::FrameContext pendingFramerContext;  //!< Frame context of pendingFramer
+
+        // FLRC burst (LR2021_FLRC_BURST, see LR2021Cfg.hpp): once a framer frame
+        // is keyed its buffer and credit go back at once; the next framer frame
+        // is written into the TX FIFO behind it and keyed on TX_DONE.
+        bool burstInFlight = false;    //!< On air: burst frame (buffer and credit already returned)
+        bool burstStaged = false;      //!< Next burst frame waiting in the TX FIFO
+        bool burstCreditHeld = false;  //!< Credit of the staged frame, granted when it is keyed
+        FwSizeType burstLen = 0;       //!< Payload length of the burst frames
 
         // Listen-before-talk (see LR2021Cfg.hpp)
         LbtCfg lbt;                 //!< Active LBT configuration
@@ -515,6 +539,18 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
                      U32 context           //!< The call order
                      ) override;
 
+    //! Handler implementation for irqIn: IRQ line edge of radio \p portNum,
+    //! service it now (TX_DONE / RX_DONE) instead of at the next run tick.
+    void irqIn_handler(FwIndexType portNum,      //!< The port number (radio index)
+                       Os::RawTime& cycleStart  //!< Edge timestamp (unused)
+                       ) override;
+
+    //! Handler implementation for pingIn: answer the health ping. Async, so a
+    //! stalled component thread shows up as missed pings.
+    void pingIn_handler(FwIndexType portNum,  //!< The port number
+                        U32 key               //!< Value to return to pinger
+                        ) override;
+
     //! Handler implementation for drvConnected (byte-stream driver ready).
     //! No-op: the initial comStatus credit is emitted by setMode(); crediting
     //! again here would let the framer send two frames before the first
@@ -724,6 +760,34 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! stamp it, make it the slot's working frame and start txSend(). On a
     //! failure the frame is returned with a FAILURE comStatus.
     void startFramerTx(FwIndexType idx, Fw::Buffer& data, const ComCfg::FrameContext& context);
+
+    //! Send the framer frame held back by a beacon on radio \p idx once the
+    //! slot is free (no-op otherwise).
+    void startPendingFramer(FwIndexType idx);
+
+    //! FLRC burst: the framer frame just keyed on \p r leaves the slot: return
+    //! its buffer and the next credit now, so the framer stack prepares the
+    //! next frame during this one's airtime (no-op outside FLRC / burst off).
+    void burstStart(RadioSlot& r);
+
+    //! FLRC burst: write framer frame \p data (burst frame on the air) into
+    //! the TX FIFO behind it and return its buffer, holding its credit until
+    //! it is keyed. A frame that cannot be staged is held in pendingFramer.
+    //! \return true if the frame was taken (staged or held)
+    bool burstStage(RadioSlot& r, Fw::Buffer& data, const ComCfg::FrameContext& context);
+
+    //! FLRC burst, on TX_DONE: key the frame staged in the TX FIFO at once (no
+    //! FIFO write, RX re-arm or retune), then grant its held credit.
+    //! \return true if a staged frame was keyed (the burst goes on)
+    bool burstKeyStaged(RadioSlot& r);
+
+    //! FLRC burst: grant the credit held for a staged frame, if any.
+    void burstGrantCredit(RadioSlot& r);
+
+    //! FLRC burst: drop the burst state of \p r (mode change, TX error): the
+    //! staged frame is lost, its held credit is granted so the downlink flow
+    //! stays open.
+    void burstAbort(RadioSlot& r);
 
     //! Re-stamp the master / virtual channel frame counts of a TM frame and
     //! recompute its FECF, if it is a frame of the configured SCID/VCID and

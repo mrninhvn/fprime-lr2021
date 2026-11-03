@@ -134,6 +134,7 @@ bool LR2021Manager ::readRfPower(F32& fwd_dbm, F32& refl_dbm) {
 }
 
 void LR2021Manager ::rfPowerMeasureTx() {
+#ifdef LR2021_HAS_RF_ADC
     // Let the PA ramp up and the detector output filters settle before
     // sampling: the TX preamble is already on the air at this point.
     this->delayMs(LR2021_RF_POWER_SETTLE_MS);
@@ -149,6 +150,7 @@ void LR2021Manager ::rfPowerMeasureTx() {
         DEBUG("fwd=%d.%d refl=%d.%d dBm", fwdX10 / 10, abs(fwdX10 % 10), reflX10 / 10, abs(reflX10 % 10));
         this->tlmWrite_RfPower(power);
     }
+#endif  // LR2021_HAS_RF_ADC: no detectors on this board, nothing to sample
 }
 
 }  // namespace LR2021

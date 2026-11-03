@@ -18,12 +18,16 @@
 
 #include <Svc/Ccsds/Utils/CRC16.hpp>
 #include <cstring>
+#ifdef __ZEPHYR__
+#include <zephyr/kernel.h>
+#endif
 
 extern "C" {
 #include "lr20xx_system.h"
 #include "lr20xx_radio_common.h"
 #include "lr20xx_radio_fifo.h"
 #include "lr20xx_radio_flrc.h"
+#include "lr20xx_regmem.h"
 }
 
 namespace LR2021 {
@@ -49,6 +53,14 @@ lr20xx_radio_flrc_pkt_params_t flrcPktParams(uint16_t pld_len) {
     params.crc_type         = FLRC_CRC;
     return params;
 }
+
+#if LR2021_FLRC_BURST
+// Genmod ShapeCfg DblRate (bit 8): TX interpolation by 16 instead of 8, only
+// allowed below 2 Mb/s. Semtech's FLRC burst TX sets it after the FLRC setup
+// (which rewrites ShapeCfg) and clears it at >= 2 Mb/s.
+constexpr uint32_t GENMOD_SHAPECFG_REG = 0x00F30904;
+constexpr uint32_t GENMOD_SHAPECFG_DBLRATE = 1UL << 8;
+#endif
 
 // Smallest CCSDS transfer frame worth checking: TC primary header (5) +
 // one data octet + FECF (2). A TM frame is larger still.
@@ -90,8 +102,10 @@ bool LR2021Manager ::flrcInit(RadioSlot& r, U32 freq_hz, I8 power_dbm) {
 
     // Park in STANDBY_XOSC after each TX/RX so a TCXO module is never
     // power-cycled across the turnaround (see the note in fskInit; harmless
-    // on crystal modules).
-    status = lr20xx_radio_common_set_rx_tx_fallback_mode(&r, LR20XX_RADIO_FALLBACK_STDBY_XOSC);
+    // on crystal modules). FS (LR2021_FLRC_FALLBACK_FS) also keeps the
+    // synthesizer locked, so the next TX of a burst starts sooner.
+    status = lr20xx_radio_common_set_rx_tx_fallback_mode(
+        &r, LR2021_FLRC_FALLBACK_FS ? LR20XX_RADIO_FALLBACK_FS : LR20XX_RADIO_FALLBACK_STDBY_XOSC);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_fallback_mode failed (%d)", status);
         return false;
@@ -132,8 +146,7 @@ bool LR2021Manager ::flrcInit(RadioSlot& r, U32 freq_hz, I8 power_dbm) {
     }
 
     // set_tx_params takes 0.5 dBm steps.
-    status = lr20xx_radio_common_set_tx_params(&r, static_cast<int8_t>(power_dbm * 2),
-                                               LR20XX_RADIO_COMMON_RAMP_96_US);
+    status = lr20xx_radio_common_set_tx_params(&r, static_cast<int8_t>(power_dbm * 2), LR2021_FLRC_PA_RAMP);
     if (status != LR20XX_STATUS_OK) {
         DEBUG("set_tx_params failed (%d)", status);
         return false;
@@ -144,6 +157,16 @@ bool LR2021Manager ::flrcInit(RadioSlot& r, U32 freq_hz, I8 power_dbm) {
         DEBUG("set_modulation_params failed (%d)", status);
         return false;
     }
+
+#if LR2021_FLRC_BURST
+    status = lr20xx_regmem_write_regmem32_mask(
+        &r, GENMOD_SHAPECFG_REG, GENMOD_SHAPECFG_DBLRATE,
+        (FLRC_RAW_BITRATE_BPS < 2000000u) ? GENMOD_SHAPECFG_DBLRATE : 0u);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("DblRate write failed (%d)", status);
+        return false;
+    }
+#endif
 
     const lr20xx_radio_flrc_pkt_params_t pkt_params = flrcPktParams(FLRC_MAX_PAYLOAD);
     status = lr20xx_radio_flrc_set_pkt_params(&r, &pkt_params);
@@ -221,6 +244,15 @@ bool LR2021Manager ::flrcTx(RadioSlot& r, const U8* data, U16 len, bool lbt) {
             return false;
         }
     }
+#if LR2021_FLRC_FALLBACK_FS
+    // Lock the synthesizer before keying (Semtech FLRC burst: "needed in
+    // 2.4GHz at low datarate to avoid crc errors").
+    status = lr20xx_system_set_fs_mode(&r);
+    if (status != LR20XX_STATUS_OK) {
+        DEBUG("TX set_fs failed (%d)", status);
+        return false;
+    }
+#endif
 
     // Key up, directly or through the CAD-LBT gate.
     if (!this->txKey(r, FLRC_TX_TIMEOUT_MS, lbt)) {
@@ -235,6 +267,14 @@ bool LR2021Manager ::flrcRx(RadioSlot& r, U32 timeout_ms) {
         return false;
     }
 
+#if LR2021_FLRC_FALLBACK_FS
+    // The FS fallback leaves the synthesizer running: back to STDBY_XOSC for
+    // the temperature read and SetRfFrequency (a standby command).
+    if (lr20xx_system_set_standby_mode(&r, LR20XX_SYSTEM_STANDBY_MODE_XOSC) != LR20XX_STATUS_OK) {
+        DEBUG("RX set_standby failed");
+        return false;
+    }
+#endif
     // On the post-TX turnaround the radio has fallen back to STDBY_XOSC (the
     // only state where the Measure Unit ADC converts), so sample die temperature
     // here before re-arming RX. At initial bring-up the chip is in STDBY_RC and
@@ -316,12 +356,15 @@ void LR2021Manager ::flrcService(RadioSlot& r) {
         if (r.workingBuffer.isValid()) {
             DEBUG("radio %d TX done, %llu bytes", static_cast<int>(r.idx), r.workingBuffer.getSize());
         }
-        // Return the frame's buffer (downlink: plus the next comStatus
-        // credit; relay: freed).
-        this->txComplete(r, Fw::Success::SUCCESS);
-        this->flrcRx(r, 0);
-        // Listen-only gap before our next TX, so the peer can get a word in.
-        this->lbtTurnaround(r);
+        // Burst: the next frame is waiting, key it right away.
+        if (!this->burstKeyStaged(r)) {
+            // Return the frame's buffer (downlink: plus the next comStatus
+            // credit; relay: freed; burst frame: already returned).
+            this->txComplete(r, Fw::Success::SUCCESS);
+            this->flrcRx(r, 0);
+            // Listen-only gap before our next TX, so the peer can get a word in.
+            this->lbtTurnaround(r);
+        }
     }
 
     if ((irq & LR20XX_SYSTEM_IRQ_RX_DONE) != 0) {
@@ -373,12 +416,168 @@ void LR2021Manager ::flrcService(RadioSlot& r) {
         // A TX timeout ends the in-flight transmission: drop its frame so the
         // slot (and the downlink credit) is not held forever, then listen.
         if (r.txInFlight) {
+            this->burstAbort(r);
             r.txInFlight = false;
             r.cadListening = false;
             this->txDrop(r);
             this->flrcRx(r, 0);
         }
     }
+}
+
+// ----------------------------------------------------------------------
+// FLRC burst (LR2021_FLRC_BURST)
+//
+// After the first frame of a burst is keyed, its buffer and the next credit
+// go back at once, so the framer stack prepares the next frame during this
+// one's airtime. That frame is written straight into the chip TX FIFO behind
+// the one on the air (credit held: one frame staged, none ever dropped) and
+// on TX_DONE it is keyed with set_tx alone: no FIFO write, RX re-arm or
+// retune in between. The radio goes back to RX when no frame is waiting.
+// Other radios (UHF) keep one frame per credit.
+//
+// Same scheme as Semtech's FLRC burst TX (usp v1.2.1
+// smtc_rac_flrc_burst.c, used by FLRP-BURST): patch RAM + 1024-byte FIFO
+// (radioInit), next packet written during the current TX, key without
+// set_pkt_params unless the length changes (never here: a burst keeps one
+// length), FS fallback with set_fs before the first key, DblRate below
+// 2 Mb/s. Semtech keys on TX_TIMESTAMP (last bit); this keys on TX_DONE.
+//
+// History (FW 0x18, driver 1.3.4, no patch RAM, 255-byte FIFO, 2026-10-30;
+// details in docs/flrc-burst.md): two frames did not fit in the FIFO; a
+// FIFO write during TX left the next packet without preamble / syncword /
+// header, so frames were staged in RAM and written at TX_DONE; that needed
+// the 128 us PA ramp (LR2021_FLRC_PA_RAMP) and >= ~450 us from TX_DONE to
+// set_tx (LR2021_FLRC_BURST_KEY_DELAY_US), and still left ~40 us of each
+// staged frame's head corrupt at 2.08 Mb/s.
+// ----------------------------------------------------------------------
+
+void LR2021Manager ::burstStart(RadioSlot& r) {
+#if LR2021_FLRC_BURST
+    if ((r.mode != RadioMode::FLRC) || !r.workingBuffer.isValid() || r.relayFrame || r.beaconFrame ||
+        (r.workingBuffer.getSize() < FLRC_MIN_PAYLOAD) || (r.workingBuffer.getSize() > BURST_FRAME_MAX)) {
+        return;
+    }
+    // The frame is in the chip now: hand the buffer back with the next credit.
+    Fw::Buffer buffer = r.workingBuffer;
+    ComCfg::FrameContext context = r.workingContext;
+    r.workingBuffer = Fw::Buffer();
+    r.workingContext = ComCfg::FrameContext();
+    r.burstInFlight = true;
+    r.burstLen = buffer.getSize();
+    if (this->isConnected_dataReturnOut_OutputPort(0)) {
+        this->dataReturnOut_out(0, buffer, context);
+    }
+    if (this->isConnected_comStatusOut_OutputPort(0)) {
+        Fw::Success success = Fw::Success::SUCCESS;
+        this->comStatusOut_out(0, success);
+    }
+    this->m_comOpen = true;
+#else
+    (void)r;
+#endif
+}
+
+bool LR2021Manager ::burstStage(RadioSlot& r, Fw::Buffer& data, const ComCfg::FrameContext& context) {
+#if LR2021_FLRC_BURST
+    if (!r.burstInFlight || !r.txInFlight) {
+        return false;
+    }
+    // Not stageable (length differs from the burst's, or a frame is staged
+    // already): hold it until the slot is free, like a frame held back by a
+    // beacon. Its buffer and credit stay out meanwhile.
+    if (r.burstStaged || r.burstCreditHeld || !data.isValid() || (data.getSize() != r.burstLen)) {
+        if (r.pendingFramer.isValid()) {
+            return false;  // cannot happen with one credit; the caller drops it
+        }
+        r.pendingFramer = data;
+        r.pendingFramerContext = context;
+        return true;
+    }
+    // Write it into the TX FIFO behind the frame on the air and return the
+    // framer buffer; the credit is held until the frame is keyed.
+    this->stampTmFrame(data.getData(), data.getSize());
+    const bool written =
+        (lr20xx_radio_fifo_write_tx(&r, data.getData(), static_cast<uint16_t>(data.getSize())) == LR20XX_STATUS_OK);
+    if (this->isConnected_dataReturnOut_OutputPort(0)) {
+        this->dataReturnOut_out(0, data, context);
+    }
+    r.burstCreditHeld = true;
+    if (!written) {
+        // Not keyed: the burst ends on TX_DONE, which grants the credit, and
+        // the next flrcTx clears the FIFO (clearing it now would cut the
+        // frame on the air).
+        DEBUG("burst fifo_write_tx failed");
+        this->log_WARNING_HI_TxFrameDropped(static_cast<U8>(r.idx));
+        return true;
+    }
+    r.burstStaged = true;
+    return true;
+#else
+    (void)r;
+    (void)data;
+    (void)context;
+    return false;
+#endif
+}
+
+bool LR2021Manager ::burstKeyStaged(RadioSlot& r) {
+#if LR2021_FLRC_BURST
+    if (!r.burstStaged) {
+        // Burst over: back to RX (the caller re-arms it). A credit is still
+        // held only after a failed FIFO write.
+        r.burstInFlight = false;
+        this->burstGrantCredit(r);
+        return false;
+    }
+#if defined(__ZEPHYR__) && (LR2021_FLRC_BURST_KEY_DELAY_US > 0)
+    // Minimum interframe (see LR2021_FLRC_BURST_KEY_DELAY_US), from handling
+    // TX_DONE. The staged frame is in the FIFO already: nothing else to do.
+    const uint32_t doneCyc = k_cycle_get_32();
+    while (k_cyc_to_us_floor32(k_cycle_get_32() - doneCyc) < LR2021_FLRC_BURST_KEY_DELAY_US) {
+    }
+#endif
+    if (lr20xx_radio_common_set_tx(&r, FLRC_TX_TIMEOUT_MS) != LR20XX_STATUS_OK) {
+        DEBUG("burst key failed");
+        this->burstAbort(r);  // drops the staged frame, grants its credit
+        return false;
+    }
+    r.burstStaged = false;
+    r.txInFlight = true;
+    this->burstGrantCredit(r);
+    return true;
+#else
+    (void)r;
+    return false;
+#endif
+}
+
+void LR2021Manager ::burstGrantCredit(RadioSlot& r) {
+    if (!r.burstCreditHeld) {
+        return;
+    }
+    r.burstCreditHeld = false;
+    if (this->isConnected_comStatusOut_OutputPort(0)) {
+        Fw::Success success = Fw::Success::SUCCESS;
+        this->comStatusOut_out(0, success);
+    }
+    this->m_comOpen = true;
+}
+
+void LR2021Manager ::burstAbort(RadioSlot& r) {
+#if LR2021_FLRC_BURST
+    if (r.burstInFlight && r.txInFlight) {
+        this->log_WARNING_HI_TxFrameDropped(static_cast<U8>(r.idx));  // burst frame cut off on the air
+    }
+    if (r.burstStaged) {
+        this->log_WARNING_HI_TxFrameDropped(static_cast<U8>(r.idx));
+    }
+    r.burstInFlight = false;
+    r.burstStaged = false;
+    this->burstGrantCredit(r);
+#else
+    (void)r;
+#endif
 }
 
 }  // namespace LR2021

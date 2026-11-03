@@ -4,11 +4,15 @@ The `LR2021::LR2021Manager` is an F´ manager component for the Semtech LR2021 (
 transceiver. It owns the vendored `lr20xx_driver` C driver, reaches the hardware through a
 Zephyr SPI bus plus reset / busy / IRQ GPIO lines, and implements the
 `Drv.ByteStreamDriverModel` interface so it can serve as the com driver of a CCSDS
-communication stack (`Svc.ComStub` / `ComCcsds` subtopology).
+communication stack (`Svc.ComStub` / `ComCcsds` subtopology). The driver comes from the
+`LR2021Hal` submodule (Semtech USP v1.2.1, `lr20xx_driver` v2.0.2); `radioInit()` loads the
+LR2021 patch RAM after every reset, as that driver requires, and switches both radio FIFOs to
+1024 bytes (1020 B TX / 1000 B RX usable).
 
 Two modulations are supported and can be switched at runtime with the `SET_MODE` command:
 
 - **FLRC** — Semtech Fast Long Range Communication (2.4 GHz band), variable-length packets.
+  Back-to-back downlink: [FLRC burst](flrc-burst.md) (`LR2021_FLRC_BURST`, on by default).
 - **FSK (GMSK)** — CCSDS-compatible UHF link: GMSK modulation per CCSDS 401.0-B, TM channel
   per CCSDS 131.0-B / 132.0-B with Reed–Solomon coding, TC channel per CCSDS 231.0-B / 232.0-B
   with BCH-coded CLTUs. This is the mode documented in detail below.
@@ -143,11 +147,13 @@ TX and RX operation (`fskApplySyncword`).
 These were found during bench bring-up (two LR2021 nodes, one per role) and shape the
 design; both were verified byte-exactly against BCH parity arithmetic.
 
-1. **256-byte radio FIFO, single-shot transfers.** The TX/RX FIFO is read/written in one
-   SPI transfer with no threshold streaming, so every on-air packet must be ≤ 256 B.
-   A 264 B packet wraps the FIFO ring and the trailing bytes overwrite codeblock 0.
-   Hence `FSK_CLTU_MAX_BLOCKS = 31` (packet exactly 256 B, verified good) and the
-   TM packet at 255 B.
+1. **Radio FIFO size, single-shot transfers.** The TX/RX FIFO is read/written in one
+   SPI transfer with no threshold streaming, so every on-air packet must fit in it. With
+   the default 256-byte FIFO a 264 B packet wrapped the FIFO ring and the trailing bytes
+   overwrote codeblock 0; hence `FSK_CLTU_MAX_BLOCKS = 31` (packet exactly 256 B, verified
+   good) and the TM packet at 255 B. `radioInit()` now configures the 1024-byte FIFOs
+   (1020 B TX / 1000 B RX, needs the patch RAM); the FSK limits above are kept (they are
+   matched to the ground segment) and have not been re-measured with the larger FIFO.
 
 2. **TX first-byte corruption with a 16-bit syncword.** The LR2021 **transmit** modem
    replaces the first payload byte after a 16-bit syncword with the preamble value
@@ -225,6 +231,10 @@ Convolutional and concatenated RS+CC were ruled out by the 10 kbps symbol-rate c
 | `FSK_CLTU_MAX_BLOCKS` | 31 | TC capacity 217 B; packet exactly 256 B (FIFO bound) |
 | `CLTU_LEAD_PAD` / `CLTU_MAX_LEAD_SKIP` | 0 / 4 | Optional TX pad; RX alignment scan |
 | `FLRC_*` | — | FLRC mode equivalents (see `LR2021Flrc.cpp`) |
+| `LR2021_FLRC_BURST` | 1 | FLRC burst downlink, see [flrc-burst.md](flrc-burst.md) |
+| `LR2021_FLRC_PA_RAMP` | 272 µs (128 µs without burst) | FLRC PA ramp time |
+| `LR2021_FLRC_FALLBACK_FS` | 1 (0 without burst) | FLRC fallback FS instead of STDBY_XOSC |
+| `LR2021_FLRC_BURST_KEY_DELAY_US` | 100 | Burst: minimum `TX_DONE` → next key |
 
 ## Requirements
 
@@ -234,4 +244,4 @@ Convolutional and concatenated RS+CC were ruled out by the 10 kbps symbol-rate c
 | LR2021-002 | In FSK mode the TM downlink shall be a CCSDS channel: ASM + fixed-length TM frame + RS(255,223) codeblock, GMSK per CCSDS 401.0-B. | Bench test, RS properties verified against CCSDS definitions |
 | LR2021-003 | In FSK mode the TC uplink shall accept CCSDS 231.0-B CLTUs (BCH(63,56) codeblocks, tail-terminated, variable length) within a 256 B capture window. | Bench test incl. variable-length CLTU |
 | LR2021-004 | The component shall switch modulation at runtime via SET_MODE and restore the active mode after RESET. | Bench test |
-| LR2021-005 | Every on-air packet shall fit the 256 B radio FIFO in a single transfer. | Static assert + bench test |
+| LR2021-005 | Every on-air packet shall fit the radio FIFO in a single transfer (1020 B TX / 1000 B RX with the 1024-byte FIFOs; FSK packets are kept ≤ 256 B). | Static assert + bench test |
