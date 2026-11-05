@@ -23,7 +23,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/adc.h>
 
-#if DT_NODE_HAS_PROP(DT_PATH(zephyr_user), io_channels)
+#if DT_PROP_HAS_NAME(DT_PATH(zephyr_user), io_channels, lr2021_fwd)
 #define LR2021_HAS_RF_ADC 1
 #endif
 #endif  // __ZEPHYR__
