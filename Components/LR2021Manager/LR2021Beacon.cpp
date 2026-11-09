@@ -231,6 +231,11 @@ void LR2021Manager ::serviceBeacon() {
     // not owned by a BER test, and its slot is free. A framer frame held back
     // by the previous beacon goes first.
     RadioSlot& r = this->m_radio[idx];
+    if (r.poweredOff) {
+        this->m_beaconPending = false;  // no waiting for POWER ON
+        this->beaconDropped(idx);
+        return;
+    }
     if (((r.mode != RadioMode::FSK) && (r.mode != RadioMode::FLRC)) || r.txTesting ||
         (this->m_ber.active && ((idx == this->m_ber.txRadio) || (idx == this->m_ber.rxRadio))) ||
         r.workingBuffer.isValid() || r.txInFlight || r.pendingFramer.isValid()) {

@@ -139,6 +139,8 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
         ModuleType moduleType = ModuleType::NICERF;
         CcsdsRole ccsdsRole = CcsdsRole::SPACECRAFT;
         RadioMode mode = RadioMode::NONE;  //!< Set by the last successful setMode()
+        bool poweredOff = false;  //!< Cut by RadioPower OFF: frames dropped, chip not accessed;
+                                  //!< mode / freqHz / powerDbm are restored by POWER ON
         U32 freqHz = 0;      //!< Base RF frequency of the last setMode()
         U32 txFreqHz = 0;    //!< TX frequency override; 0 = use freqHz
         U32 rxFreqHz = 0;    //!< RX frequency override; 0 = use freqHz
@@ -746,6 +748,22 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! slot's LBT hold. FAILURE closes the com flow until the next successful
     //! setMode().
     void txComplete(RadioSlot& r, Fw::Success status);
+
+    //! Abort any in-flight or LBT-held TX of slot \p r (the frame is dropped
+    //! through txComplete() with FAILURE) and cancel a timed TX test.
+    void txAbort(RadioSlot& r);
+
+    //! Discard a framer frame: return its buffer and grant the next comStatus
+    //! credit (SUCCESS), so the routes of the other targets keep flowing.
+    void frameDiscard(Fw::Buffer& data, const ComCfg::FrameContext& context);
+
+    //! RadioPower OFF: drop every frame slot \p r holds, cut its load switch
+    //! and keep the com flow open. Until radioPowerOn() the chip is not accessed.
+    void radioPowerOff(RadioSlot& r);
+
+    //! RadioPower ON after radioPowerOff(): radioInit(), then restore the mode,
+    //! frequency and power the radio had. \return true when the radio is back up
+    bool radioPowerOn(RadioSlot& r);
 
     //! Forward a packet of \p len bytes received by radio \p idx to the
     //! configured RX sink (dataOut in flight, or the byte-stream/UART driver

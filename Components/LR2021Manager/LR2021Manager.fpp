@@ -186,8 +186,10 @@ module LR2021 {
         )
 
         @ Turn a radio module's load switch on or off. OFF cuts power to the
-        @ chip (bench / fault-recovery use); bring it back with POWER ON
-        @ followed by RESET (which re-runs radioInit + restores the mode).
+        @ chip (bench / fault-recovery use) and drops every frame routed to it
+        @ until POWER ON, which re-runs radioInit and restores the mode, so the
+        @ radio is back on the air without a further command. While off, the
+        @ commands that configure the chip fail. BUSY during a BER test.
         async command RadioPower(
             radio: U8 @< Radio index (0 or 1)
             power: Fw.On @< ON = power the module, OFF = cut power

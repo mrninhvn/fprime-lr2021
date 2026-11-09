@@ -285,15 +285,7 @@ void LR2021Manager ::txComplete(RadioSlot& r, Fw::Success status) {
     }
 }
 
-bool LR2021Manager ::setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 power_dbm) {
-    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
-    RadioSlot& r = this->m_radio[idx];
-
-    // A mode switch aborts any in-flight or LBT-held TX: drop the frame,
-    // returning its buffer to the framer (or freeing a relay frame). It also
-    // cancels any pending timed TX test on this slot (setMode is how run()
-    // restores RX after a test, and an explicit command should override a
-    // running test too).
+void LR2021Manager ::txAbort(RadioSlot& r) {
     if (r.workingBuffer.isValid()) {
         this->txComplete(r, Fw::Success::FAILURE);
     }
@@ -304,6 +296,75 @@ bool LR2021Manager ::setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 po
     r.peerBusyUntil = Fw::Time();
     r.txQuietUntil = Fw::Time();
     r.txTesting = false;
+}
+
+void LR2021Manager ::frameDiscard(Fw::Buffer& data, const ComCfg::FrameContext& context) {
+    if (this->isConnected_dataReturnOut_OutputPort(0)) {
+        this->dataReturnOut_out(0, data, context);
+    }
+    if (this->isConnected_comStatusOut_OutputPort(0)) {
+        Fw::Success success = Fw::Success::SUCCESS;
+        this->comStatusOut_out(0, success);
+    }
+}
+
+void LR2021Manager ::radioPowerOff(RadioSlot& r) {
+    // A timed TX test parks r.mode at NONE: take over the mode it would restore,
+    // so power on brings that one back.
+    if (r.txTesting) {
+        r.mode = r.txTestMode;
+        r.freqHz = r.txTestFreqHz;
+        r.powerDbm = r.txTestPowerDbm;
+    }
+    r.poweredOff = true;
+
+    this->txAbort(r);
+    if (r.pendingFramer.isValid()) {
+        Fw::Buffer frame = r.pendingFramer;
+        const ComCfg::FrameContext frameContext = r.pendingFramerContext;
+        r.pendingFramer = Fw::Buffer();
+        r.pendingFramerContext = ComCfg::FrameContext();
+        this->frameDiscard(frame, frameContext);
+    }
+
+    this->powerGpioWrite_out(r.idx, Fw::Logic::LOW);
+
+    // txAbort() may have closed the com flow, and no setMode() will re-open it
+    // now: re-open it here so the routes of the other targets keep flowing.
+    if (!this->m_comOpen && this->isConnected_comStatusOut_OutputPort(0)) {
+        Fw::Success success = Fw::Success::SUCCESS;
+        this->comStatusOut_out(0, success);
+        this->m_comOpen = true;
+    }
+}
+
+bool LR2021Manager ::radioPowerOn(RadioSlot& r) {
+    // radioInit() switches the load switch on and resets the chip. The slot
+    // stays marked off until the radio is back up, so frames keep being dropped
+    // on a failure and another POWER ON retries.
+    if (!this->radioInit(r.idx)) {
+        return false;
+    }
+    r.poweredOff = false;  // setMode() refuses a slot marked off
+    const bool ok = (r.mode == RadioMode::NONE) || this->setMode(r.idx, r.mode, r.freqHz, r.powerDbm);
+    r.poweredOff = !ok;
+    return ok;
+}
+
+bool LR2021Manager ::setMode(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 power_dbm) {
+    FW_ASSERT((idx >= 0) && (idx < NUM_RADIOS), static_cast<FwAssertArgType>(idx));
+    RadioSlot& r = this->m_radio[idx];
+
+    if (r.poweredOff) {
+        return false;
+    }
+
+    // A mode switch aborts any in-flight or LBT-held TX: drop the frame,
+    // returning its buffer to the framer (or freeing a relay frame). It also
+    // cancels any pending timed TX test on this slot (setMode is how run()
+    // restores RX after a test, and an explicit command should override a
+    // running test too).
+    this->txAbort(r);
 
     bool ok = false;
     switch (mode) {
@@ -378,6 +439,9 @@ bool LR2021Manager ::txTest(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 pow
         return false;
     }
     RadioSlot& r = this->m_radio[idx];
+    if (r.poweredOff) {
+        return false;
+    }
 
     // A test switch aborts any in-flight or held TX, same as setMode().
     if (r.workingBuffer.isValid()) {
@@ -448,6 +512,11 @@ void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
     for (FwIndexType i = 0; i < NUM_RADIOS; i++) {
         RadioSlot& r = this->m_radio[i];
 
+        // No chip to talk to until POWER ON.
+        if (r.poweredOff) {
+            continue;
+        }
+
         // Non-blocking timed TX test: while a test carrier is up on this slot
         // (r.mode parked at NONE), stop servicing it and just watch the clock.
         // When the deadline passes, restore normal continuous RX (setMode also
@@ -507,8 +576,9 @@ void LR2021Manager ::startPendingFramer(FwIndexType idx) {
 void LR2021Manager ::irqIn_handler(FwIndexType portNum, Os::RawTime& cycleStart) {
     FW_ASSERT((portNum >= 0) && (portNum < NUM_RADIOS), static_cast<FwAssertArgType>(portNum));
     RadioSlot& r = this->m_radio[portNum];
-    // A timed TX test owns the slot until run() restores it.
-    if (r.txTesting) {
+    // A timed TX test owns the slot until run() restores it; a slot powered off
+    // has no chip to service.
+    if (r.txTesting || r.poweredOff) {
         return;
     }
     // Same IRQ service as run(): a TX_DONE returns the frame and grants the
@@ -647,13 +717,7 @@ void LR2021Manager ::dataIn_handler(FwIndexType portNum,
     // Disabled route: discard the frame and grant the next credit so the other
     // routes keep flowing. Silent, as it happens for every frame on the route.
     if (idx == DISABLED_RADIO) {
-        if (this->isConnected_dataReturnOut_OutputPort(0)) {
-            this->dataReturnOut_out(0, data, context);
-        }
-        if (this->isConnected_comStatusOut_OutputPort(0)) {
-            Fw::Success success = Fw::Success::SUCCESS;
-            this->comStatusOut_out(0, success);
-        }
+        this->frameDiscard(data, context);
         return;
     }
 
@@ -723,6 +787,12 @@ void LR2021Manager ::dataIn_handler(FwIndexType portNum,
     }
 
     RadioSlot& r = this->m_radio[idx];
+
+    // Radio powered off: discard like a disabled route, until POWER ON.
+    if (r.poweredOff) {
+        this->frameDiscard(data, context);
+        return;
+    }
 
     // The radio is sending a beacon (outside the credit flow): hold the frame
     // and send it from run() once the beacon is done. The single comStatus
@@ -868,6 +938,12 @@ void LR2021Manager ::relayUplink(Fw::Buffer& data) {
         return;
     }
 
+    if (r.poweredOff) {
+        DEBUG("radio %d uplink relay dropped (powered off)", static_cast<int>(idx));
+        this->deallocate_out(0, data);
+        return;
+    }
+
     // The relay frame becomes the slot's working frame (flagged relayFrame:
     // no dataReturnOut / comStatus credit) so LBT can hold it; txComplete()
     // frees it once it is sent or dropped.
@@ -909,6 +985,11 @@ void LR2021Manager ::RadioReset_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U8 r
     // radioInit() resets the chip and re-applies the chip-level config
     // (regulator, clocks, DIO routing / RF switches).
     RadioSlot& r = this->m_radio[radio];
+    // radioInit() would switch the load switch back on: that is POWER ON's job.
+    if (r.poweredOff) {
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::EXECUTION_ERROR);
+        return;
+    }
     bool ok = this->radioInit(radio);
     if (ok && (r.mode != RadioMode::NONE)) {
         // Restore the previously active mode so the link comes back up.
@@ -960,7 +1041,23 @@ void LR2021Manager ::RadioPower_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U8 r
         this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::EXECUTION_ERROR);
         return;
     }
-    this->powerGpioWrite_out(radio, (power == Fw::On::ON) ? Fw::Logic::HIGH : Fw::Logic::LOW);
+    RadioSlot& r = this->m_radio[radio];
+    if (power == Fw::On::OFF) {
+        // A running BER test keeps driving its radios until it finishes.
+        if (this->m_ber.active && ((radio == this->m_ber.txRadio) || (radio == this->m_ber.rxRadio))) {
+            this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::BUSY);
+            return;
+        }
+        this->radioPowerOff(r);
+    } else if (r.poweredOff) {
+        if (!this->radioPowerOn(r)) {
+            this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::EXECUTION_ERROR);
+            return;
+        }
+    } else {
+        // Not switched off by this command: never touch a running radio.
+        this->powerGpioWrite_out(radio, Fw::Logic::HIGH);
+    }
     this->log_ACTIVITY_HI_PowerSet(radio, power);
     this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
 }
@@ -1127,6 +1224,7 @@ void LR2021Manager ::RadioBerTest_cmdHandler(FwOpcodeType opCode,
     // accepts any non-zero length.
     const U16 min_len = (target == RadioMode::FLRC) ? FLRC_MIN_PAYLOAD : 1;
     const bool valid = (target != RadioMode::NONE) && (tx_radio != rx_radio) &&
+                       !this->m_radio[tx_radio].poweredOff && !this->m_radio[rx_radio].poweredOff &&
                        (num_packets >= 1) && (num_packets <= BER_MAX_PACKETS) &&
                        (payload_len >= min_len) && (payload_len <= BER_MAX_PAYLOAD);
     if (!valid || this->m_ber.active) {
