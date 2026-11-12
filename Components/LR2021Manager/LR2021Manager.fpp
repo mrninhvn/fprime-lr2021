@@ -53,6 +53,20 @@ module LR2021 {
             DISABLED = 5 @< Not sent: frames on this route are discarded
         }
 
+        @ Which frequency of a radio RadioSetFreq sets
+        enum FreqSelect {
+            TX @< TX frequency
+            RX @< RX (rest) frequency
+        }
+
+        @ Phase of the TX cycle (RadioTxEnable)
+        enum TxCyclePhase: U8 {
+            OFF = 0 @< Not running: the default links and routes
+            NICERF = 1 @< Radio 0 on its link, every downlink to it, radio 1 off
+            REYAX_UHF = 2 @< Radio 1 on the link of radio 0, every downlink to it, radio 0 off
+            REYAX_SBAND = 3 @< Radio 1 on its own link, every downlink to it, radio 0 off
+        }
+
 
         # ----------------------------------------------------------------------
         # Com adapter interface (Svc.Com), routed by frame context.
@@ -168,6 +182,17 @@ module LR2021 {
         output port setPoly: Svc.Poly
 
         # ----------------------------------------------------------------------
+        # Parameter database (TX cycle): PRM_COM_* links / routes / running
+        # flag, PRM_MODE_LAST_TIME_RX_COM. Unconnected: no TX cycle
+        # ----------------------------------------------------------------------
+
+        @ Read a parameter of the TX cycle
+        output port prmGetOut: Fw.PrmGet
+
+        @ Write the TX cycle running flag (PRM_COM_TX_CYCLE)
+        output port prmSetOut: Fw.PrmSet
+
+        # ----------------------------------------------------------------------
         # Commands
         # ----------------------------------------------------------------------
 
@@ -177,11 +202,14 @@ module LR2021 {
         )
 
         @ Switch the active modulation of one radio at runtime
-        @ (re-initialises the radio and enters continuous RX)
+        @ (re-initialises the radio and enters continuous RX). The TX and RX
+        @ frequencies must be in the same band (both below or both above
+        @ 1 GHz: one RF path per mode). CW: the carrier is keyed on tx_freq_hz.
         async command RadioSetMode(
             radio: U8 @< Radio index (0 or 1)
             mode: Mode @< Modulation to activate
-            freq_hz: U32 @< RF centre frequency in Hz (e.g. 437000000)
+            tx_freq_hz: U32 @< TX frequency in Hz (e.g. 423000000)
+            rx_freq_hz: U32 @< RX (rest) frequency in Hz (e.g. 420000000)
             power_dbm: I8 @< TX output power in dBm
         )
 
@@ -204,11 +232,15 @@ module LR2021 {
             mode: Mode @< Modulation to activate
         )
 
-        @ Change only the RF centre frequency of a radio, keeping its active
-        @ mode and TX power. Requires the radio to already have an active mode.
+        @ Change the TX or the RX frequency of a radio (as the topology's
+        @ setTxFreq / setRxFreq), keeping the other one, its active mode and TX
+        @ power. The frequency must stay in the band of the active mode (below
+        @ or above 1 GHz); use RadioSetMode to change band. Requires the radio
+        @ to already have an active mode.
         async command RadioSetFreq(
             radio: U8 @< Radio index (0 or 1)
-            freq_hz: U32 @< RF centre frequency in Hz (e.g. 437000000)
+            select: FreqSelect @< Frequency to set: TX or RX
+            freq_hz: U32 @< Frequency in Hz (e.g. 437000000)
         )
 
         @ Change only the TX output power of a radio, keeping its active mode
@@ -239,7 +271,7 @@ module LR2021 {
         async command RadioTxTest(
             radio: U8 @< Radio index (0 or 1)
             mode: Mode @< FSK or FLRC packet engine to key the test pattern on
-            freq_hz: U32 @< RF centre frequency in Hz
+            freq_hz: U32 @< Test carrier frequency in Hz
             power_dbm: I8 @< TX output power in dBm
             duration_s: U32 @< How long to key the test TX, in seconds
         )
@@ -299,6 +331,30 @@ module LR2021 {
             radio: U8 @< Radio index (0 or 1)
         )
 
+        @ Turn the FLRC burst downlink of a radio on or off at runtime (builds
+        @ with LR2021_FLRC_BURST 1, where it is on at boot). OFF: one frame per
+        @ credit with an RX re-arm after each TX; a burst on the air ends with
+        @ the frame being sent. Only the frame chaining is switched: the PA
+        @ ramp, the FS fallback and DblRate stay those of the build. Not kept
+        @ over a reset. ENABLED in a build without the burst: EXECUTION_ERROR.
+        async command RadioSetBurst(
+            radio: U8 @< Radio index (0 or 1)
+            burst: Fw.Enabled @< ENABLED = burst downlink, DISABLED = one frame per credit
+        )
+
+        @ RF allowed (MissionController LEOP, TransmitCom). With the parameter
+        @ database connected, TRUE starts the TX cycle: radio 0 on its link for
+        @ LR2021_TX_CYCLE_NICERF_S, radio 1 on the link of radio 0 for
+        @ LR2021_TX_CYCLE_REYAX_UHF_S, radio 1 on its own link for
+        @ LR2021_TX_CYCLE_SBAND_S, again; every downlink to the radio of the
+        @ phase, the other one off. It goes on after a reset, until the first
+        @ ground command (PRM_MODE_LAST_TIME_RX_COM changes) or FALSE, which
+        @ restore the default links and routes (PRM_COM_*). Without the
+        @ parameter database: nothing to do, OK.
+        async command RadioTxEnable(
+            enable: bool @< TRUE: start the TX cycle; FALSE: stop it
+        ) opcode 0x100
+
         # ----------------------------------------------------------------------
         # Events
         # ----------------------------------------------------------------------
@@ -342,6 +398,14 @@ module LR2021 {
         @ RadioTxTest finished: normal continuous RX restored
         event TxTestDone(radio: U8) severity activity high \
             format "Radio {} TX test done, RX restored"
+
+        @ TX cycle entered a phase (OFF: ended, default links and routes restored)
+        event TxCycleSet(cycle_phase: TxCyclePhase) severity activity high \
+            format "TX cycle phase {}"
+
+        @ TX cycle could not put a radio on a link
+        event TxCycleRadioError(radio: U8, cycle_phase: TxCyclePhase) severity warning high \
+            format "TX cycle: radio {} not set up for phase {}"
 
         @ RadioTxTest given a mode other than FSK/FLRC (e.g. CW), or the test
         @ carrier / RX restore failed to key

@@ -200,7 +200,26 @@ Convolutional and concatenated RS+CC were ruled out by the 10 kbps symbol-rate c
 | Name | Description |
 |---|---|
 | RESET | Re-initialise the chip (`radioInit()`) and restore the active mode/frequency/power |
-| SET_MODE(mode, freq_hz, power_dbm) | Switch modulation (FLRC / FSK) at runtime; enters continuous RX |
+| RadioSetMode(radio, mode, tx_freq_hz, rx_freq_hz, power_dbm) | Switch modulation (FLRC / FSK / CW) at runtime on the TX and RX frequencies given (same band: both below or both above 1 GHz); enters continuous RX |
+| RadioSetFreq(radio, select, freq_hz) | Change the TX or the RX frequency (`select`) of a configured radio, as `setTxFreq` / `setRxFreq`, keeping the other one, its mode and power; in the band of the active mode |
+| RadioSetBurst(radio, burst) | Turn the FLRC burst downlink of a radio on or off at runtime (see [flrc-burst.md](flrc-burst.md)); only the frame chaining is switched, not kept over a reset |
+| RadioTxEnable(enable) | RF allowed (MissionController LEOP TransmitCom, `CmdIds.comTxEnable`, opcode 0x100): TRUE starts the TX cycle, FALSE stops it; OK without doing anything when `prmGetOut` / `prmSetOut` are not connected |
+
+## TX Cycle (Sat3/Sat4, `LR2021TxCycle.cpp`)
+
+Runs only with the parameter database connected (`prmGetOut` / `prmSetOut`, TlmBeaconDeployment).
+
+| Phase | Radios | Downlink (EVT, TLM, FILE) | Length |
+|---|---|---|---|
+| NICERF | radio 0 on its link, radio 1 off | radio 0 | `LR2021_TX_CYCLE_NICERF_S` (1 h) |
+| REYAX_UHF | radio 1 on the link of radio 0, radio 0 off | radio 1 | `LR2021_TX_CYCLE_REYAX_UHF_S` (1 h) |
+| REYAX_SBAND | radio 1 on its own link, radio 0 off | radio 1 | `LR2021_TX_CYCLE_SBAND_S` (30 min) |
+
+- Then NICERF again. A link is a mode, a TX and an RX frequency (same band) and a TX power, set in one `setMode()` (TX / RX frequencies first, so the radio never sits outside the band of the link); a radio that is off is powered on with it.
+- Links and routes: the `PRM_COM_RADIOn_*` / `PRM_COM_ROUTE_*` parameters, read at every phase, never written; a parameter not stored keeps the setup the radio had when the cycle started.
+- `PRM_COM_TX_CYCLE` = 1 while it runs: the first `run()` after a reset starts it again from NICERF.
+- Ends at the first ground command (`PRM_MODE_LAST_TIME_RX_COM`, stamped by UplinkMonitor, differs from its value at the start; checked every `LR2021_TX_CYCLE_SERVICE_TICKS` run ticks) or with RadioTxEnable FALSE: both radios on their links, the routes back, `PRM_COM_TX_CYCLE` = 0.
+- A radio that cannot be set up (`TxCycleRadioError`) keeps the downlink where it was and the other radio on; every phase change is reported by `TxCycleSet`.
 
 ## Events / Telemetry
 
@@ -209,6 +228,7 @@ Convolutional and concatenated RS+CC were ruled out by the 10 kbps symbol-rate c
 | LR2021 | event, diagnostic | Debug / bring-up log |
 | HalError | event, warning high | HAL / SPI operation failed |
 | ModeSet | event, activity high | Radio mode changed |
+| TxCycleSet / TxCycleRadioError | events | TX cycle phase entered (OFF: ended); a radio not set up for a phase |
 | FskRxPacket / FskTxDone / FskError | events | FSK link activity and radio errors |
 | FlrcRxPacket / FlrcTxDone / FlrcError | events | FLRC equivalents |
 | FskTxCount / FskRxCount / FskRssi | telemetry | FSK link counters and last RSSI |
@@ -235,6 +255,8 @@ Convolutional and concatenated RS+CC were ruled out by the 10 kbps symbol-rate c
 | `LR2021_FLRC_PA_RAMP` | 272 µs (128 µs without burst) | FLRC PA ramp time |
 | `LR2021_FLRC_FALLBACK_FS` | 1 (0 without burst) | FLRC fallback FS instead of STDBY_XOSC |
 | `LR2021_FLRC_BURST_KEY_DELAY_US` | 100 | Burst: minimum `TX_DONE` → next key |
+| `LR2021_TX_CYCLE_NICERF_S` / `_REYAX_UHF_S` / `_SBAND_S` | 3600 / 3600 / 1800 | TX cycle phase lengths (s) |
+| `LR2021_TX_CYCLE_SERVICE_TICKS` | 100 | run() ticks between two TX cycle checks |
 
 ## Requirements
 
@@ -245,3 +267,4 @@ Convolutional and concatenated RS+CC were ruled out by the 10 kbps symbol-rate c
 | LR2021-003 | In FSK mode the TC uplink shall accept CCSDS 231.0-B CLTUs (BCH(63,56) codeblocks, tail-terminated, variable length) within a 256 B capture window. | Bench test incl. variable-length CLTU |
 | LR2021-004 | The component shall switch modulation at runtime via SET_MODE and restore the active mode after RESET. | Bench test |
 | LR2021-005 | Every on-air packet shall fit the radio FIFO in a single transfer (1020 B TX / 1000 B RX with the 1024-byte FIFOs; FSK packets are kept ≤ 256 B). | Static assert + bench test |
+| LR2021-006 | Once RF is allowed (RadioTxEnable TRUE) and with the parameter database connected, the component shall rotate the downlink NiceRF (1 h) → REYAX on the NiceRF link (1 h) → REYAX S-band (30 min), the radio off its turn powered off, until the first ground command or RadioTxEnable FALSE, then restore the default links and routes (PRM_COM_*, never written by the cycle); a cycle running at a reset shall start again from NiceRF. | Bench test |

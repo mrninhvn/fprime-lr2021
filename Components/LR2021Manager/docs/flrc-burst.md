@@ -23,6 +23,12 @@ USP v1.2.1, used by FLRP-BURST). For the component architecture see the
 | `LR2021_FLRC_BURST_KEY_DELAY_US` | 100 | — | Spin from handling `TX_DONE` to keying the next frame |
 | `LR2021_FLRC_FALLBACK_FS` | 1 | 0 | Fallback after TX/RX: FS (synthesizer stays locked) or STDBY_XOSC |
 
+In a build with the burst, `RadioSetBurst(radio, DISABLED / ENABLED)` turns it off and on at
+runtime: off, every frame goes out alone (one credit, RX re-armed after each TX), a burst on the
+air ending with the frame being sent. Only the frame chaining is switched; the PA ramp, the FS
+fallback and DblRate stay those of the build, the setup a lone frame already uses. The switch is
+not kept over a reset (on again at boot). In a build without the burst, ENABLED is refused.
+
 Burst on also writes Genmod ShapeCfg DblRate (register `0x00F30904`, bit 8) in `flrcInit()`:
 set below 2 Mb/s, cleared at 2.08 / 2.6 Mb/s, as Semtech does after its FLRC setup.
 

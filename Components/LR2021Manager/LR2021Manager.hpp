@@ -77,6 +77,11 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Route-table target meaning "do not send": frames are discarded. One past HOST.
     static constexpr FwIndexType DISABLED_RADIO = HOST_RADIO + 1;
 
+    //! Band of a frequency: the HF RX path / PA from 1 GHz up, the LF ones
+    //! below (the split fskInit / flrcInit make). One band per mode: the TX
+    //! and RX frequencies of a radio must be in the same one.
+    static bool isHfBand(U32 freq_hz) { return freq_hz >= 1000000000U; }
+
     //! Number of synchronous send retries on the byte-stream driver.
     static constexpr FwIndexType UART_RETRY_LIMIT = 3;
 
@@ -167,6 +172,7 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
         bool burstStaged = false;      //!< Next burst frame waiting in the TX FIFO
         bool burstCreditHeld = false;  //!< Credit of the staged frame, granted when it is keyed
         FwSizeType burstLen = 0;       //!< Payload length of the burst frames
+        bool burstEnabled = true;      //!< Burst allowed (RadioSetBurst; no effect without LR2021_FLRC_BURST)
 
         // Listen-before-talk (see LR2021Cfg.hpp)
         LbtCfg lbt;                 //!< Active LBT configuration
@@ -617,7 +623,8 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
                                  U32 cmdSeq,               //!< The command sequence number
                                  U8 radio,                 //!< Radio index
                                  LR2021Manager_Mode mode,  //!< Modulation to activate
-                                 U32 freq_hz,              //!< RF centre frequency in Hz
+                                 U32 tx_freq_hz,           //!< TX frequency in Hz
+                                 U32 rx_freq_hz,           //!< RX (rest) frequency in Hz
                                  I8 power_dbm              //!< TX output power in dBm
                                 ) override;
 
@@ -641,11 +648,12 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
 
     //! Handler implementation for command RadioSetFreq
     //!
-    //! Change only the RF centre frequency of a radio, keeping mode/power
-    void RadioSetFreq_cmdHandler(FwOpcodeType opCode,  //!< The opcode
-                                 U32 cmdSeq,           //!< The command sequence number
-                                 U8 radio,             //!< Radio index
-                                 U32 freq_hz           //!< RF centre frequency in Hz
+    //! Change the TX or the RX frequency of a radio, keeping mode/power
+    void RadioSetFreq_cmdHandler(FwOpcodeType opCode,           //!< The opcode
+                                 U32 cmdSeq,                    //!< The command sequence number
+                                 U8 radio,                      //!< Radio index
+                                 LR2021Manager_FreqSelect select,  //!< Frequency to set
+                                 U32 freq_hz                    //!< Frequency in Hz
                                 ) override;
 
     //! Handler implementation for command RadioSetPower
@@ -715,6 +723,23 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
                                     U32 cmdSeq,           //!< The command sequence number
                                     U8 radio              //!< Radio index
                                     ) override;
+
+    //! Handler implementation for command RadioSetBurst
+    //!
+    //! Turn the FLRC burst downlink of a radio on or off
+    void RadioSetBurst_cmdHandler(FwOpcodeType opCode,  //!< The opcode
+                                  U32 cmdSeq,           //!< The command sequence number
+                                  U8 radio,             //!< Radio index
+                                  Fw::Enabled burst     //!< ENABLED = burst downlink
+                                  ) override;
+
+    //! Handler implementation for command RadioTxEnable
+    //!
+    //! RF allowed: start (TRUE) or stop (FALSE) the TX cycle
+    void RadioTxEnable_cmdHandler(FwOpcodeType opCode,  //!< The opcode
+                                  U32 cmdSeq,           //!< The command sequence number
+                                  bool enable           //!< TRUE: start the TX cycle; FALSE: stop it
+                                  ) override;
 
   private:
     // ----------------------------------------------------------------------
@@ -881,6 +906,52 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     RadioSlot m_radio[NUM_RADIOS];  //!< Per-radio state (driver contexts)
     BerTest m_ber;                  //!< Running / last BER test state
     FwIndexType m_txRoute[TX_ROUTE_TABLE_SIZE] = {0};  //!< comQueueIndex -> radio
+
+    // ----------------------------------------------------------------------
+    // TX cycle (RadioTxEnable, LR2021TxCycle.cpp)
+    // ----------------------------------------------------------------------
+
+    //! Downlink queues the TX cycle routes: EVT, TLM, FILE (RouteQueue values)
+    static constexpr FwIndexType TX_CYCLE_QUEUES = 3;
+
+    //! A radio link: what a slot is set to
+    struct TxLink {
+        RadioMode mode;
+        U32 txFreqHz;
+        U32 rxFreqHz;
+        I8 powerDbm;
+    };
+
+    LR2021Manager_TxCyclePhase m_txPhase = LR2021Manager_TxCyclePhase::OFF;  //!< Current phase
+    Os::RawTime m_txPhaseStart;                     //!< When the phase was entered
+    U32 m_txServiceTicks = 0;                       //!< run() ticks since the last check
+    bool m_txBootChecked = false;                   //!< PRM_COM_TX_CYCLE read after the boot setup
+    U32 m_txCycleTimeRx = 0;                        //!< PRM_MODE_LAST_TIME_RX_COM when the cycle started
+    bool m_txCycleTimeRxValid = false;              //!< ... and whether it was stored then
+    TxLink m_txFallback[NUM_RADIOS];                //!< Links when the cycle started (parameter not stored)
+    FwIndexType m_txFallbackRoute[TX_CYCLE_QUEUES] = {0};  //!< Routes when the cycle started
+
+    //! The parameter database is connected and this build knows the PRM_COM_* IDs
+    bool txCycleAvailable();
+    //! First run() after the boot setup: carry on a cycle that was running at the reset
+    void txCycleBoot();
+    //! Start the cycle from its first phase (the links and routes now are the fallbacks)
+    void txCycleStart();
+    //! End the cycle: default links and routes back, running flag cleared
+    void txCycleStop();
+    //! From run(): next phase when the time is over, stop at the first ground command
+    void txCycleService();
+    //! Set the radios and routes of a phase (OFF: the defaults)
+    void txCycleEnter(LR2021Manager_TxCyclePhase phase);
+    //! Default link of radio idx: PRM_COM_RADIOn_* where stored, else the fallback
+    TxLink txCycleLink(FwIndexType idx);
+    //! Put radio idx on a link (powered on first if off)
+    bool txCycleApply(FwIndexType idx, const TxLink& link);
+    //! Save the running flag
+    void txCycleSaveRunning(bool running);
+    //! Read a parameter; false when not stored
+    template <typename T>
+    bool txCyclePrm(FwPrmIdType id, T& value);
     RxSink m_rxSink = RxSink::DATA_OUT;                 //!< Destination for received packets
     bool m_comOpen = false;         //!< Initial comStatus READY emitted / flow open
     ComCfg::FrameContext m_sdrContext;  //!< Context of the framer frame out on sdrOut (one credit, one frame)

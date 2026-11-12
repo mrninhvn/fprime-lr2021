@@ -508,6 +508,14 @@ bool LR2021Manager ::txTest(FwIndexType idx, RadioMode mode, U32 freq_hz, I8 pow
 // ----------------------------------------------------------------------
 
 void LR2021Manager ::run_handler(FwIndexType portNum, U32 context) {
+    // TX cycle: carried on after a reset (first tick, once the topology set
+    // the radios up), then its clock and the first ground command
+    if (!this->m_txBootChecked) {
+        this->m_txBootChecked = true;
+        this->txCycleBoot();
+    }
+    this->txCycleService();
+
     // Poll radio IRQs (TX done / RX done / errors) on every radio.
     for (FwIndexType i = 0; i < NUM_RADIOS; i++) {
         RadioSlot& r = this->m_radio[i];
@@ -1002,11 +1010,23 @@ void LR2021Manager ::RadioSetMode_cmdHandler(FwOpcodeType opCode,
                                              U32 cmdSeq,
                                              U8 radio,
                                              LR2021Manager_Mode mode,
-                                             U32 freq_hz,
+                                             U32 tx_freq_hz,
+                                             U32 rx_freq_hz,
                                              I8 power_dbm) {
     if (radio >= NUM_RADIOS) {
         this->log_WARNING_LO_BadRadioIndex(radio);
         this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    // One RF path per mode: both frequencies given, in the same band
+    if ((tx_freq_hz == 0U) || (rx_freq_hz == 0U) || (isHfBand(tx_freq_hz) != isHfBand(rx_freq_hz))) {
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    RadioSlot& r = this->m_radio[radio];
+    if (r.poweredOff) {
+        // Nothing stored for a radio that cannot be set: POWER ON restores what it had
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::EXECUTION_ERROR);
         return;
     }
     RadioMode target = RadioMode::NONE;
@@ -1024,7 +1044,13 @@ void LR2021Manager ::RadioSetMode_cmdHandler(FwOpcodeType opCode,
             break;
     }
 
-    const bool ok = this->setMode(radio, target, freq_hz, power_dbm);
+    // The mode takes the TX frequency as its base one (band, PA / RX path) and
+    // tunes to the two given. CW keys its carrier on the frequency the mode
+    // init programs, the RX (rest) one: it is the TX frequency meanwhile.
+    r.txFreqHz = tx_freq_hz;
+    r.rxFreqHz = (target == RadioMode::CW) ? tx_freq_hz : rx_freq_hz;
+    const bool ok = this->setMode(radio, target, tx_freq_hz, power_dbm);
+    r.rxFreqHz = rx_freq_hz;
     if (ok) {
         this->log_ACTIVITY_HI_ModeSet(radio, mode);
     }
@@ -1095,7 +1121,11 @@ void LR2021Manager ::RadioSetModulation_cmdHandler(FwOpcodeType opCode, U32 cmdS
     this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
 }
 
-void LR2021Manager ::RadioSetFreq_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U8 radio, U32 freq_hz) {
+void LR2021Manager ::RadioSetFreq_cmdHandler(FwOpcodeType opCode,
+                                             U32 cmdSeq,
+                                             U8 radio,
+                                             LR2021Manager_FreqSelect select,
+                                             U32 freq_hz) {
     if (radio >= NUM_RADIOS) {
         this->log_WARNING_LO_BadRadioIndex(radio);
         this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
@@ -1107,7 +1137,25 @@ void LR2021Manager ::RadioSetFreq_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U8
         this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
         return;
     }
-    const bool ok = this->setMode(radio, r.mode, freq_hz, r.powerDbm);
+    // The band (PA / RX path) is that of the active mode: RadioSetMode changes it
+    if ((freq_hz == 0U) || (isHfBand(freq_hz) != isHfBand(r.freqHz))) {
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    // The mode is set again in both cases: it re-enters RX on the new RX
+    // frequency and the next TX tunes to the new TX one
+    switch (select.e) {
+        case LR2021Manager_FreqSelect::TX:
+            r.txFreqHz = freq_hz;
+            break;
+        case LR2021Manager_FreqSelect::RX:
+            r.rxFreqHz = freq_hz;
+            break;
+        default:
+            this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+            return;
+    }
+    const bool ok = this->setMode(radio, r.mode, r.freqHz, r.powerDbm);
     this->cmdResponse_out(opCode, cmdSeq, ok ? Fw::CmdResponse::OK : Fw::CmdResponse::EXECUTION_ERROR);
 }
 

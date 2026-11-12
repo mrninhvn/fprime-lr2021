@@ -44,6 +44,7 @@ register_fprime_module(
         "${CMAKE_CURRENT_LIST_DIR}/LR2021Lbt.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/LR2021Rs.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/LR2021Beacon.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/LR2021TxCycle.cpp"
         ${lr20xx_src}
     DEPENDS
         Fw_Types

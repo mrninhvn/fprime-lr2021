@@ -427,4 +427,19 @@ constexpr uint32_t LBT_FSK_PREAMBLE_HOLD_US =
 #define LBT_NOISE_REPORT_MS 2000
 #endif
 
+// TX cycle (RadioTxEnable): length of each phase, in seconds, and the run()
+// ticks between two checks of the clock and of the last ground command.
+#ifndef LR2021_TX_CYCLE_NICERF_S
+#define LR2021_TX_CYCLE_NICERF_S 3600U  // radio 0 (NiceRF) on its UHF link
+#endif
+#ifndef LR2021_TX_CYCLE_REYAX_UHF_S
+#define LR2021_TX_CYCLE_REYAX_UHF_S 3600U  // radio 1 (REYAX) on the UHF link of radio 0
+#endif
+#ifndef LR2021_TX_CYCLE_SBAND_S
+#define LR2021_TX_CYCLE_SBAND_S 1800U  // radio 1 (REYAX) on its own S-band link
+#endif
+#ifndef LR2021_TX_CYCLE_SERVICE_TICKS
+#define LR2021_TX_CYCLE_SERVICE_TICKS 100U  // ~1 s at the 100 Hz run rate
+#endif
+
 #endif /* _LR2021_LR2021CFG_HPP_ */

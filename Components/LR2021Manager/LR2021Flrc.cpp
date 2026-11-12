@@ -454,8 +454,9 @@ void LR2021Manager ::flrcService(RadioSlot& r) {
 
 void LR2021Manager ::burstStart(RadioSlot& r) {
 #if LR2021_FLRC_BURST
-    if ((r.mode != RadioMode::FLRC) || !r.workingBuffer.isValid() || r.relayFrame || r.beaconFrame ||
-        (r.workingBuffer.getSize() < FLRC_MIN_PAYLOAD) || (r.workingBuffer.getSize() > BURST_FRAME_MAX)) {
+    if (!r.burstEnabled || (r.mode != RadioMode::FLRC) || !r.workingBuffer.isValid() || r.relayFrame ||
+        r.beaconFrame || (r.workingBuffer.getSize() < FLRC_MIN_PAYLOAD) ||
+        (r.workingBuffer.getSize() > BURST_FRAME_MAX)) {
         return;
     }
     // The frame is in the chip now: hand the buffer back with the next credit.
@@ -483,10 +484,12 @@ bool LR2021Manager ::burstStage(RadioSlot& r, Fw::Buffer& data, const ComCfg::Fr
     if (!r.burstInFlight || !r.txInFlight) {
         return false;
     }
-    // Not stageable (length differs from the burst's, or a frame is staged
-    // already): hold it until the slot is free, like a frame held back by a
-    // beacon. Its buffer and credit stay out meanwhile.
-    if (r.burstStaged || r.burstCreditHeld || !data.isValid() || (data.getSize() != r.burstLen)) {
+    // Not stageable (length differs from the burst's, a frame is staged
+    // already, or the burst was turned off meanwhile): hold it until the slot
+    // is free, like a frame held back by a beacon. Its buffer and credit stay
+    // out meanwhile.
+    if (!r.burstEnabled || r.burstStaged || r.burstCreditHeld || !data.isValid() ||
+        (data.getSize() != r.burstLen)) {
         if (r.pendingFramer.isValid()) {
             return false;  // cannot happen with one credit; the caller drops it
         }
@@ -562,6 +565,26 @@ void LR2021Manager ::burstGrantCredit(RadioSlot& r) {
         this->comStatusOut_out(0, success);
     }
     this->m_comOpen = true;
+}
+
+void LR2021Manager ::RadioSetBurst_cmdHandler(FwOpcodeType opCode, U32 cmdSeq, U8 radio, Fw::Enabled burst) {
+    if (radio >= NUM_RADIOS) {
+        this->log_WARNING_LO_BadRadioIndex(radio);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
+        return;
+    }
+    const bool enable = (burst == Fw::Enabled::ENABLED);
+#if !LR2021_FLRC_BURST
+    // Not built in (and the PA ramp of this build is not the burst one)
+    if (enable) {
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::EXECUTION_ERROR);
+        return;
+    }
+#endif
+    // Off during a burst: the frame on the air (and one already staged behind
+    // it) still go out, the next one is sent as a single frame.
+    this->m_radio[radio].burstEnabled = enable;
+    this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
 }
 
 void LR2021Manager ::burstAbort(RadioSlot& r) {
