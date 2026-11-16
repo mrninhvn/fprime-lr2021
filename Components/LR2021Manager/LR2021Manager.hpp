@@ -96,6 +96,17 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! arrive before the result is tallied, in milliseconds.
     static constexpr U32 BER_DRAIN_MS = 2000;
 
+    //! RadioBerTest tx_radio / rx_radio value for a far end outside this
+    //! component (the ground SDR modem): only the other side is driven here.
+    static constexpr FwIndexType BER_EXTERNAL = 255;
+
+    //! Receive-only BER test (tx_radio = BER_EXTERNAL): how long to wait for
+    //! the first packet before giving up, in milliseconds.
+    static constexpr U32 BER_RX_START_TIMEOUT_MS = 30000;
+
+    //! Period of the Ber* telemetry while a test runs, in milliseconds.
+    static constexpr U32 BER_TLM_PERIOD_MS = 1000;
+
     // ----------------------------------------------------------------------
     // Radio-level types
     // ----------------------------------------------------------------------
@@ -452,20 +463,28 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Arm a BER test: configure \p txRadio and \p rxRadio for \p mode /
     //! \p freq_hz / \p power_dbm on the dedicated BER channel and start the
     //! non-blocking send/receive state machine driven by run(). \p txRadio
-    //! and \p rxRadio must differ. \return true if both radios were armed
+    //! and \p rxRadio must differ; one of them may be BER_EXTERNAL (the far
+    //! end is the ground SDR: transmit only / receive only).
+    //! \return true if the radio(s) were armed
     bool berStart(FwIndexType txRadio, FwIndexType rxRadio, RadioMode mode, U32 freq_hz,
                   I8 power_dbm, U32 num_packets, U16 payload_len, U32 interval_ms);
 
     //! Advance the running BER test: paces test-packet TX and, once every
-    //! packet is sent plus a drain window, finalizes the result. Called from
-    //! run() each tick; no-op when no test is active.
+    //! packet is sent plus a drain window (or, receive only, once every packet
+    //! arrived or the packets stopped), finalizes the result; writes the Ber*
+    //! telemetry every BER_TLM_PERIOD_MS. Called from run() each tick; no-op
+    //! when no test is active.
     void berDrive();
+
+    //! Write the Ber* telemetry from the running tallies; \return the packets
+    //! the transmitter sent (as reported in BerTestDone)
+    U32 berWriteTlm();
 
     //! Finalize the running BER test: emit BerTestDone + telemetry and restore
     //! both radios to their pre-test configuration (berRestore).
     void berFinish();
 
-    //! Put both BER radios back exactly as berStart() found them: TX/RX
+    //! Put the BER radio(s) back exactly as berStart() found them: TX/RX
     //! frequency overrides, then mode / freq / power (a radio that had no
     //! active mode is parked in standby).
     void berRestore();
@@ -863,8 +882,9 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
 
     //! Phase of a running BER test.
     enum class BerPhase {
-        SENDING,   //!< Still transmitting test packets
-        DRAINING   //!< All sent; waiting for the last packets to arrive
+        SENDING,    //!< Still transmitting test packets
+        DRAINING,   //!< All sent; waiting for the last packets to arrive
+        RECEIVING   //!< Receive only (external transmitter): counting packets
     };
 
     //! Pre-test configuration of one radio, restored when the BER test ends.
@@ -879,7 +899,7 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
     //! Non-blocking BER test. active gates run()'s send/tally loop and the
     //! RX-service interception; every field is set by berStart().
     struct BerTest {
-        BerSavedRadio saved[2];  //!< [0] = TX radio, [1] = RX radio, before the test
+        BerSavedRadio saved[2];  //!< [0] = TX radio, [1] = RX radio, before the test (unused if external)
         bool active = false;
         BerPhase phase = BerPhase::SENDING;
         FwIndexType txRadio = 0;
@@ -896,6 +916,9 @@ class LR2021Manager final : public LR2021ManagerComponentBase {
         U32 totalBits = 0;      //!< Payload bits compared so far
         Fw::Time nextTxTime;    //!< Earliest time to send the next packet
         Fw::Time drainEnd;      //!< Deadline that ends the drain phase
+        Fw::Time lastRxTime;    //!< Last packet received (receive-only end)
+        Fw::Time rxDeadline;    //!< Receive only: deadline for the first packet
+        Fw::Time nextTlmTime;   //!< Next Ber* telemetry update while running
         U8 pattern[BER_MAX_PAYLOAD];  //!< Reference PRBS9 payload pattern
     };
 

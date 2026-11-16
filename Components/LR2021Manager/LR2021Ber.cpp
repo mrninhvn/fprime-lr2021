@@ -5,7 +5,9 @@
 //
 // One radio module transmits a fixed PRBS9 pattern; a second module
 // receives it and the software counts payload bit errors against the known
-// pattern. The over-the-air path is raw (no CCSDS RS / CLTU / randomization,
+// pattern. Either end may instead be external (BER_EXTERNAL, the ground SDR
+// modem, which sends / counts the same packets): the test then only
+// transmits, or only receives. The over-the-air path is raw (no CCSDS RS / CLTU / randomization,
 // CRC off) so the measurement is the true channel BER. The whole thing is a
 // non-blocking state machine driven by run(): berDrive() paces the TX and
 // finalizes; berRxIntercept() is called from the FSK / FLRC RX_DONE service
@@ -46,8 +48,11 @@ bool LR2021Manager ::berStart(FwIndexType txRadio,
                               U32 num_packets,
                               U16 payload_len,
                               U32 interval_ms) {
-    if ((txRadio == rxRadio) || (txRadio >= NUM_RADIOS) || (rxRadio >= NUM_RADIOS) ||
-        (payload_len == 0) || (payload_len > BER_MAX_PAYLOAD)) {
+    const bool txExt = (txRadio == BER_EXTERNAL);
+    const bool rxExt = (rxRadio == BER_EXTERNAL);
+    if ((txRadio == rxRadio) || (!txExt && ((txRadio < 0) || (txRadio >= NUM_RADIOS))) ||
+        (!rxExt && ((rxRadio < 0) || (rxRadio >= NUM_RADIOS))) || (payload_len == 0) ||
+        (payload_len > BER_MAX_PAYLOAD)) {
         return false;
     }
     if ((mode != RadioMode::FSK) && (mode != RadioMode::FLRC)) {
@@ -62,6 +67,9 @@ bool LR2021Manager ::berStart(FwIndexType txRadio,
     this->m_ber.rxRadio = rxRadio;
     const FwIndexType radios[2] = {txRadio, rxRadio};
     for (FwIndexType i = 0; i < 2; i++) {
+        if (radios[i] == BER_EXTERNAL) {
+            continue;
+        }
         RadioSlot& r = this->m_radio[radios[i]];
         BerSavedRadio& s = this->m_ber.saved[i];
         s.mode = r.mode;
@@ -77,9 +85,9 @@ bool LR2021Manager ::berStart(FwIndexType txRadio,
     // in normal continuous RX (role-based for FSK, raw for FLRC). FLRC RX is
     // already a raw byte pipe; the FSK RX must be switched off the CCSDS role
     // channel onto the dedicated raw BER syncword / fixed length.
-    bool ok = this->setMode(txRadio, mode, freq_hz, power_dbm) &&
-              this->setMode(rxRadio, mode, freq_hz, power_dbm);
-    if (ok && (mode == RadioMode::FSK)) {
+    bool ok = (txExt || this->setMode(txRadio, mode, freq_hz, power_dbm)) &&
+              (rxExt || this->setMode(rxRadio, mode, freq_hz, power_dbm));
+    if (ok && !rxExt && (mode == RadioMode::FSK)) {
         ok = this->fskBerRx(this->m_radio[rxRadio], payload_len);
     }
     if (!ok) {
@@ -89,8 +97,10 @@ bool LR2021Manager ::berStart(FwIndexType txRadio,
 
     this->berFillPattern(this->m_ber.pattern, payload_len);
 
+    const Fw::Time now = this->getTime();
     this->m_ber.active = true;
-    this->m_ber.phase = BerPhase::SENDING;
+    // Receive only: count what the external transmitter sends.
+    this->m_ber.phase = txExt ? BerPhase::RECEIVING : BerPhase::SENDING;
     this->m_ber.mode = mode;
     this->m_ber.freqHz = freq_hz;
     this->m_ber.powerDbm = power_dbm;
@@ -101,7 +111,11 @@ bool LR2021Manager ::berStart(FwIndexType txRadio,
     this->m_ber.recvCount = 0;
     this->m_ber.bitErrors = 0;
     this->m_ber.totalBits = 0;
-    this->m_ber.nextTxTime = this->getTime();  // first packet may go immediately
+    this->m_ber.nextTxTime = now;  // first packet may go immediately
+    this->m_ber.nextTlmTime = now;
+    Fw::Time deadline = now;
+    deadline.add(BER_RX_START_TIMEOUT_MS / 1000, (BER_RX_START_TIMEOUT_MS % 1000) * 1000);
+    this->m_ber.rxDeadline = deadline;
     return true;
 }
 
@@ -147,6 +161,7 @@ bool LR2021Manager ::berRxIntercept(RadioSlot& r, U16 pkt_len) {
         this->berCompare(payload, pkt_len);
     }
     this->m_ber.recvCount++;
+    this->m_ber.lastRxTime = this->getTime();
 
     // Re-arm RX on the BER channel for the next packet (FLRC RX is raw already).
     if (this->m_ber.mode == RadioMode::FSK) {
@@ -162,6 +177,31 @@ void LR2021Manager ::berDrive() {
         return;
     }
     const Fw::Time now = this->getTime();
+
+    // Running tallies for the ground (dashboard) while the test runs.
+    if (now >= this->m_ber.nextTlmTime) {
+        (void)this->berWriteTlm();
+        Fw::Time next = now;
+        next.add(BER_TLM_PERIOD_MS / 1000, (BER_TLM_PERIOD_MS % 1000) * 1000);
+        this->m_ber.nextTlmTime = next;
+    }
+
+    if (this->m_ber.phase == BerPhase::RECEIVING) {
+        // Receive only: done once every announced packet arrived, once the
+        // packets stopped for a drain window, or if none ever came.
+        bool done = (this->m_ber.recvCount >= this->m_ber.totalPackets);
+        if (this->m_ber.recvCount == 0) {
+            done = done || (now >= this->m_ber.rxDeadline);
+        } else {
+            Fw::Time quiet = this->m_ber.lastRxTime;
+            quiet.add(BER_DRAIN_MS / 1000, (BER_DRAIN_MS % 1000) * 1000);
+            done = done || (now >= quiet);
+        }
+        if (done) {
+            this->berFinish();
+        }
+        return;
+    }
 
     if (this->m_ber.phase == BerPhase::SENDING) {
         if (this->m_ber.sentCount >= this->m_ber.totalPackets) {
@@ -190,10 +230,32 @@ void LR2021Manager ::berDrive() {
     }
 }
 
-void LR2021Manager ::berFinish() {
-    const U32 sent = this->m_ber.sentCount;
+U32 LR2021Manager ::berWriteTlm() {
+    // Receive only: the external transmitter sends the announced num_packets.
+    // Transmit only: nothing is received here (the ground counts), so nothing
+    // is lost either.
+    const bool txExt = (this->m_ber.txRadio == BER_EXTERNAL);
+    const bool rxExt = (this->m_ber.rxRadio == BER_EXTERNAL);
+    const U32 sent = txExt ? this->m_ber.totalPackets : this->m_ber.sentCount;
     const U32 recv = this->m_ber.recvCount;
-    const U32 lost = (sent > recv) ? (sent - recv) : 0;
+    const U32 lost = (!rxExt && (sent > recv)) ? (sent - recv) : 0;
+    const U32 totalBits = this->m_ber.totalBits;
+    U32 berPpm = 0;
+    if (totalBits > 0) {
+        berPpm = static_cast<U32>((static_cast<U64>(this->m_ber.bitErrors) * 1000000ULL) / totalBits);
+    }
+    this->tlmWrite_BerBitErrors(this->m_ber.bitErrors);
+    this->tlmWrite_BerBitsTotal(totalBits);
+    this->tlmWrite_BerRatePpm(berPpm);
+    this->tlmWrite_BerPacketsRecv(recv);
+    this->tlmWrite_BerPacketsLost(lost);
+    return sent;
+}
+
+void LR2021Manager ::berFinish() {
+    const U32 sent = this->berWriteTlm();
+    const U32 recv = this->m_ber.recvCount;
+    const U32 lost = ((this->m_ber.rxRadio != BER_EXTERNAL) && (sent > recv)) ? (sent - recv) : 0;
     const U32 bitErrors = this->m_ber.bitErrors;
     const U32 totalBits = this->m_ber.totalBits;
     U32 berPpm = 0;
@@ -208,11 +270,6 @@ void LR2021Manager ::berFinish() {
 
     this->m_ber.active = false;
 
-    this->tlmWrite_BerBitErrors(bitErrors);
-    this->tlmWrite_BerBitsTotal(totalBits);
-    this->tlmWrite_BerRatePpm(berPpm);
-    this->tlmWrite_BerPacketsRecv(recv);
-    this->tlmWrite_BerPacketsLost(lost);
     this->log_ACTIVITY_HI_BerTestDone(static_cast<U8>(this->m_ber.txRadio),
                                       static_cast<U8>(this->m_ber.rxRadio), this->m_ber.freqHz,
                                       bitrateBps, sent, recv, lost, bitErrors, totalBits, berPpm);
@@ -224,6 +281,9 @@ void LR2021Manager ::berRestore() {
     const FwIndexType radios[2] = {this->m_ber.txRadio, this->m_ber.rxRadio};
     for (FwIndexType i = 0; i < 2; i++) {
         const FwIndexType idx = radios[i];
+        if (idx == BER_EXTERNAL) {
+            continue;
+        }
         RadioSlot& r = this->m_radio[idx];
         const BerSavedRadio& s = this->m_ber.saved[i];
         // Overrides first: setMode() programs the chip from them.

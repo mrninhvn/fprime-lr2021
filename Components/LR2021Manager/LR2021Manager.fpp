@@ -291,13 +291,19 @@ module LR2021 {
         @ returns once the test is armed (BerTestStarted); run() paces the TX,
         @ tallies RX, and emits BerTestDone with the result when it finishes.
         @ Downlink frames routed to either radio are dropped while a test runs.
+        @ Either end may be 255 = external (the ground SDR modem, which sends /
+        @ counts the same packets): tx_radio 255 = receive only, the test ends
+        @ when num_packets arrived, 2 s after the last packet, or after 30 s
+        @ without any; rx_radio 255 = transmit only, received / lost / bit
+        @ errors stay 0 (the ground counts them). The Ber* channels are
+        @ updated every second while a test runs.
         async command RadioBerTest(
-            tx_radio: U8 @< Transmitting radio index (0 or 1)
-            rx_radio: U8 @< Receiving radio index (0 or 1), must differ from tx_radio
+            tx_radio: U8 @< Transmitting radio index (0 or 1), 255 = external (receive only)
+            rx_radio: U8 @< Receiving radio index (0 or 1), 255 = external (transmit only); must differ from tx_radio
             mode: Mode @< FSK or FLRC packet engine for the test
             freq_hz: U32 @< RF centre frequency in Hz (same for both radios)
             power_dbm: I8 @< TX output power in dBm
-            num_packets: U32 @< Number of test packets to transmit
+            num_packets: U32 @< Number of test packets to transmit (receive only: the external transmitter's count)
             payload_len: U16 @< Test payload length per packet, in bytes
             interval_ms: U32 @< Minimum spacing between packets, in ms (0 = as fast as possible)
         )
@@ -514,13 +520,14 @@ module LR2021 {
         @ Total payload bits compared in the last / running BER test
         telemetry BerBitsTotal: U32 update on change
 
-        @ Bit error rate of the last BER test, in parts per million (errors/bits)
+        @ Bit error rate of the last / running BER test, in parts per million (errors/bits)
         telemetry BerRatePpm: U32 update on change
 
         @ Packets received during the last / running BER test
         telemetry BerPacketsRecv: U32 update on change
 
-        @ Packets transmitted but not received during the last BER test
+        @ Packets transmitted but not received during the last / running BER test
+        @ (0 when transmitting only to an external receiver)
         telemetry BerPacketsLost: U32 update on change
 
         @ TX attempts deferred because the channel was busy (link-aware

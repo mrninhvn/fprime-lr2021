@@ -1249,8 +1249,12 @@ void LR2021Manager ::RadioBerTest_cmdHandler(FwOpcodeType opCode,
                                              U32 num_packets,
                                              U16 payload_len,
                                              U32 interval_ms) {
-    if ((tx_radio >= NUM_RADIOS) || (rx_radio >= NUM_RADIOS)) {
-        this->log_WARNING_LO_BadRadioIndex((tx_radio >= NUM_RADIOS) ? tx_radio : rx_radio);
+    // 255 (BER_EXTERNAL) = the far end is the ground SDR: transmit only /
+    // receive only.
+    const bool txExt = (tx_radio == BER_EXTERNAL);
+    const bool rxExt = (rx_radio == BER_EXTERNAL);
+    if ((!txExt && (tx_radio >= NUM_RADIOS)) || (!rxExt && (rx_radio >= NUM_RADIOS))) {
+        this->log_WARNING_LO_BadRadioIndex((!txExt && (tx_radio >= NUM_RADIOS)) ? tx_radio : rx_radio);
         this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::VALIDATION_ERROR);
         return;
     }
@@ -1272,7 +1276,8 @@ void LR2021Manager ::RadioBerTest_cmdHandler(FwOpcodeType opCode,
     // accepts any non-zero length.
     const U16 min_len = (target == RadioMode::FLRC) ? FLRC_MIN_PAYLOAD : 1;
     const bool valid = (target != RadioMode::NONE) && (tx_radio != rx_radio) &&
-                       !this->m_radio[tx_radio].poweredOff && !this->m_radio[rx_radio].poweredOff &&
+                       (txExt || !this->m_radio[tx_radio].poweredOff) &&
+                       (rxExt || !this->m_radio[rx_radio].poweredOff) &&
                        (num_packets >= 1) && (num_packets <= BER_MAX_PACKETS) &&
                        (payload_len >= min_len) && (payload_len <= BER_MAX_PAYLOAD);
     if (!valid || this->m_ber.active) {
